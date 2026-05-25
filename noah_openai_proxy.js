@@ -41,8 +41,12 @@ function parseAuthToken(token) {
   }
 }
 
-function buildCookieHeader(authToken) {
-  return `NOAH_AI_AUTH_TOKEN=${authToken}`;
+function buildCookieHeader(authToken, extraCookies) {
+  let cookie = `NOAH_AI_AUTH_TOKEN=${authToken}`;
+  if (extraCookies) {
+    cookie += `; ${extraCookies}`;
+  }
+  return cookie;
 }
 
 function httpsRequest(url, options, body) {
@@ -80,11 +84,11 @@ function httpsRequest(url, options, body) {
 
 // ============ Noah AI 接口封装 ============
 
-async function createSession(authToken, gptsId = DEFAULT_GPTS_ID) {
+async function createSession(authToken, gptsId = DEFAULT_GPTS_ID, extraCookies = "") {
   const url = `${NOAH_BASE}/api/noah-chat-svc/session/createSession`;
   const headers = {
     "Content-Type": "application/json",
-    Cookie: buildCookieHeader(authToken),
+    Cookie: buildCookieHeader(authToken, extraCookies),
     Origin: NOAH_BASE,
     Referer: `${NOAH_BASE}/home`,
     "User-Agent": "Mozilla/5.0 (compatible; NoahAI-Proxy/1.0)",
@@ -99,14 +103,14 @@ async function createSession(authToken, gptsId = DEFAULT_GPTS_ID) {
   throw new Error(`createSession failed: ${JSON.stringify(res.data)}`);
 }
 
-async function streamChat(authToken, sessionId, content, model, res) {
+async function streamChat(authToken, sessionId, content, model, res, extraCookies = "") {
   const tokenInfo = parseAuthToken(authToken);
   const workNo = tokenInfo.workNo || "unknown";
 
   const url = `${NOAH_BASE}/api/noah-chat-svc/chat/streamChat`;
   const headers = {
     "Content-Type": "application/json",
-    Cookie: buildCookieHeader(authToken),
+    Cookie: buildCookieHeader(authToken, extraCookies),
     Origin: NOAH_BASE,
     Referer: `${NOAH_BASE}/home`,
     "User-Agent": "Mozilla/5.0 (compatible; NoahAI-Proxy/1.0)",
@@ -238,6 +242,9 @@ async function handleChatCompletions(req, res) {
     return;
   }
 
+  // 额外 cookie：可通过 x-extra-cookies header 或 body 中的 extra_cookies 传入
+  const extraCookies = req.headers["x-extra-cookies"] || params.extra_cookies || "";
+
   const model = params.model || "gpt-5.5-thinking";
   const stream = params.stream || false;
   const messages = params.messages || [];
@@ -265,10 +272,10 @@ async function handleChatCompletions(req, res) {
   try {
     // Step 1: 创建会话
     const gptsId = params.gpts_id || DEFAULT_GPTS_ID;
-    const sessionId = await createSession(authToken, gptsId);
+    const sessionId = await createSession(authToken, gptsId, extraCookies);
 
     // Step 2: 发送消息并获取流式响应
-    const upstream = await streamChat(authToken, sessionId, content, model, res);
+    const upstream = await streamChat(authToken, sessionId, content, model, res, extraCookies);
 
     if (stream) {
       // 流式模式 → 转为 OpenAI SSE 格式
