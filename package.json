@@ -1,0 +1,14 @@
+{
+  "name": "noah-ai-proxy",
+  "version": "1.0.0",
+  "description": "Noah AI → OpenAI compatible proxy server",
+  "main": "noah_openai_proxy.js",
+  "scripts": {
+    "start": "node noah_openai_proxy.js"
+  },
+  "keywords": ["openai", "proxy", "noah-ai", "chat-completions", "sse"],
+  "license": "MIT",
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
