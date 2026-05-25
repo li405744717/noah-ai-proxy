@@ -175,41 +175,81 @@ function buildOpenAIResponse(id, model, content) {
 
 // ============ SSE 解析 (Noah → OpenAI) ============
 
-function parseNoahSSE(rawChunk) {
-  // Noah AI SSE 格式:
-  //   event:start / event:record / event:data / event:end / event:error
-  //   data:{"chunk":"xxx"} (在 event:data 下)
-  //   data:{"chatId":xxx,"parentChatId":xxx} (在 event:record 下)
-  const lines = rawChunk.split("\n");
-  let content = "";
-  let done = false;
-  let currentEvent = "";
+class NoahSSEParser {
+  constructor(onChunk, onDone, onError) {
+    this.buffer = "";
+    this.onChunk = onChunk;
+    this.onDone = onDone;
+    this.onError = onError;
+  }
 
-  for (const line of lines) {
-    if (line.startsWith("event:")) {
-      currentEvent = line.slice(6).trim();
-      if (currentEvent === "end" || currentEvent === "stop") {
-        done = true;
-      }
-    } else if (line.startsWith("data:")) {
-      const data = line.slice(5).trim();
-      if (data === "[DONE]") { done = true; continue; }
-      if (!data) continue;
-      try {
-        const parsed = JSON.parse(data);
-        if (parsed.chunk) content += parsed.chunk;
-        else if (parsed.content) content += parsed.content;
-        else if (parsed.data && parsed.data.content) content += parsed.data.content;
-        else if (parsed.choices && parsed.choices[0]) {
-          const delta = parsed.choices[0].delta || parsed.choices[0].message;
-          if (delta && delta.content) content += delta.content;
-        }
-      } catch {
-        // 忽略非JSON data行
-      }
+  feed(rawData) {
+    this.buffer += rawData;
+    // SSE 事件以 \n\n 分隔
+    const events = this.buffer.split("\n\n");
+    // 最后一段可能不完整，保留在 buffer
+    this.buffer = events.pop() || "";
+
+    for (const event of events) {
+      this._processEvent(event.trim());
     }
   }
-  return { done, content };
+
+  flush() {
+    if (this.buffer.trim()) {
+      this._processEvent(this.buffer.trim());
+      this.buffer = "";
+    }
+  }
+
+  _processEvent(eventBlock) {
+    if (!eventBlock) return;
+    const lines = eventBlock.split("\n");
+    let eventType = "";
+    let dataLine = "";
+
+    for (const line of lines) {
+      if (line.startsWith("event:")) {
+        eventType = line.slice(6).trim();
+      } else if (line.startsWith("data:")) {
+        dataLine = line.slice(5).trim();
+      } else if (line.startsWith("id:")) {
+        // ignore id field
+      }
+    }
+
+    if (eventType === "end" || eventType === "stop" || eventType === "done") {
+      this.onDone();
+      return;
+    }
+
+    if (eventType === "error") {
+      this.onError(new Error(dataLine || "upstream error"));
+      return;
+    }
+
+    if (dataLine === "[DONE]") {
+      this.onDone();
+      return;
+    }
+
+    if (!dataLine) return;
+
+    try {
+      const parsed = JSON.parse(dataLine);
+      let content = "";
+      if (parsed.chunk) content = parsed.chunk;
+      else if (parsed.content) content = parsed.content;
+      else if (parsed.data && parsed.data.content) content = parsed.data.content;
+      else if (parsed.choices && parsed.choices[0]) {
+        const delta = parsed.choices[0].delta || parsed.choices[0].message;
+        if (delta && delta.content) content = delta.content;
+      }
+      if (content) this.onChunk(content);
+    } catch {
+      // 非JSON data行，忽略
+    }
+  }
 }
 
 // ============ HTTP Server ============
@@ -297,21 +337,34 @@ async function handleChatCompletions(req, res) {
         })}\n\n`
       );
 
-      upstream.on("data", (chunk) => {
-        const text = chunk.toString("utf-8");
-        const parsed = parseNoahSSE(text);
+      const parser = new NoahSSEParser(
+        (content) => {
+          if (!res.writableEnded) {
+            res.write(buildOpenAIChunk(completionId, model, content));
+          }
+        },
+        () => {
+          if (!res.writableEnded) {
+            res.write(buildOpenAIChunk(completionId, model, null, "stop"));
+            res.write("data: [DONE]\n\n");
+            res.end();
+          }
+        },
+        (err) => {
+          if (!res.writableEnded) {
+            res.write(`data: ${JSON.stringify({ error: { message: err.message } })}\n\n`);
+            res.write("data: [DONE]\n\n");
+            res.end();
+          }
+        }
+      );
 
-        if (parsed.content) {
-          res.write(buildOpenAIChunk(completionId, model, parsed.content));
-        }
-        if (parsed.done) {
-          res.write(buildOpenAIChunk(completionId, model, null, "stop"));
-          res.write("data: [DONE]\n\n");
-          res.end();
-        }
+      upstream.on("data", (chunk) => {
+        parser.feed(chunk.toString("utf-8"));
       });
 
       upstream.on("end", () => {
+        parser.flush();
         if (!res.writableEnded) {
           res.write(buildOpenAIChunk(completionId, model, null, "stop"));
           res.write("data: [DONE]\n\n");
@@ -321,7 +374,7 @@ async function handleChatCompletions(req, res) {
 
       upstream.on("error", (err) => {
         if (!res.writableEnded) {
-          res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+          res.write(`data: ${JSON.stringify({ error: { message: err.message } })}\n\n`);
           res.end();
         }
       });
@@ -330,12 +383,19 @@ async function handleChatCompletions(req, res) {
       let fullContent = "";
 
       await new Promise((resolve, reject) => {
+        const parser = new NoahSSEParser(
+          (content) => { fullContent += content; },
+          () => { resolve(); },
+          (err) => { reject(err); }
+        );
+
         upstream.on("data", (chunk) => {
-          const text = chunk.toString("utf-8");
-          const parsed = parseNoahSSE(text);
-          if (parsed.content) fullContent += parsed.content;
+          parser.feed(chunk.toString("utf-8"));
         });
-        upstream.on("end", resolve);
+        upstream.on("end", () => {
+          parser.flush();
+          resolve();
+        });
         upstream.on("error", reject);
       });
 
