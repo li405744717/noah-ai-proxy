@@ -208,8 +208,6 @@ function getContentWithoutToolCalls(text) {
 }
 
 function inferToolCalls(responseText, tools, messages) {
-  // 当模型没有按 <tool_call> 格式输出时，根据上下文智能推断是否应该调用工具
-  // 这是因为 Noah AI 后端模型不支持原生 tool calling
   const lastUserMsg = [...messages].reverse().find(m => m.role === "user");
   if (!lastUserMsg) return [];
 
@@ -218,30 +216,52 @@ function inferToolCalls(responseText, tools, messages) {
     : (lastUserMsg.content || []).filter(p => p.type === "text").map(p => p.text).join(" ");
 
   const toolMap = {};
+  const toolNames = [];
   for (const tool of tools) {
     const fn = tool.function || tool;
     toolMap[fn.name] = fn;
+    toolNames.push(fn.name);
+  }
+
+  // 找到对应工具名（支持各种变体）
+  function findReadTool() {
+    const names = ["read_file", "Read", "readFile", "read", "file_read", "cat_file", "get_file"];
+    return toolNames.find(n => names.includes(n) || /read|file/i.test(n));
+  }
+  function findCmdTool() {
+    const names = ["run_command", "Bash", "bash", "execute", "exec", "shell", "run_shell", "command"];
+    return toolNames.find(n => names.includes(n) || /bash|shell|command|exec/i.test(n));
+  }
+  function findGlobTool() {
+    return toolNames.find(n => /glob|list.*file|find.*file/i.test(n));
+  }
+  function findGrepTool() {
+    return toolNames.find(n => /grep|search|find.*content/i.test(n));
   }
 
   const calls = [];
+  const readTool = findReadTool();
+  const cmdTool = findCmdTool();
+  const globTool = findGlobTool();
 
   // 检测文件读取意图
-  if (toolMap["read_file"] || toolMap["Read"] || toolMap["readFile"]) {
-    const readToolName = toolMap["read_file"] ? "read_file" : (toolMap["Read"] ? "Read" : "readFile");
+  if (readTool) {
     const filePatterns = [
-      /(?:读取|查看|打开|看看|read|cat|show)\s*[`"']?([a-zA-Z0-9_\-./\\]+\.[a-zA-Z0-9]+)[`"']?/i,
-      /[`"']([a-zA-Z0-9_\-./\\]+\.[a-zA-Z0-9]+)[`"']\s*(?:文件|的内容|file)/i,
-      /(?:file|文件)\s*[`"']?([a-zA-Z0-9_\-./\\]+\.[a-zA-Z0-9]+)[`"']?/i,
+      /(?:读取|查看|打开|看看|read|cat|show|检查|分析)\s*[`"']?([a-zA-Z0-9_\-./\\]+\.[a-zA-Z0-9]+)[`"']?/i,
+      /[`"']([a-zA-Z0-9_\-./\\]+\.[a-zA-Z0-9]+)[`"']\s*(?:文件|的内容|file|的代码)/i,
+      /(?:file|文件|代码)\s*[`"']?([a-zA-Z0-9_\-./\\]+\.[a-zA-Z0-9]+)[`"']?/i,
     ];
     for (const pattern of filePatterns) {
       const match = userContent.match(pattern);
       if (match) {
+        const fn = toolMap[readTool];
+        const paramName = fn.parameters?.properties ? Object.keys(fn.parameters.properties)[0] : "path";
         calls.push({
           id: `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
           type: "function",
           function: {
-            name: readToolName,
-            arguments: JSON.stringify({ path: match[1] }),
+            name: readTool,
+            arguments: JSON.stringify({ [paramName]: match[1] }),
           },
         });
         return calls;
@@ -250,21 +270,22 @@ function inferToolCalls(responseText, tools, messages) {
   }
 
   // 检测命令执行意图
-  if (toolMap["run_command"] || toolMap["Bash"] || toolMap["execute"]) {
-    const cmdToolName = toolMap["run_command"] ? "run_command" : (toolMap["Bash"] ? "Bash" : "execute");
+  if (cmdTool) {
     const cmdPatterns = [
       /(?:执行|运行|run|exec)\s*[`"'](.+?)[`"']/i,
-      /```(?:bash|sh|shell)?\s*\n(.+?)\n```/s,
+      /```(?:bash|sh|shell|cmd|powershell)?\s*\n(.+?)\n```/s,
     ];
     for (const pattern of cmdPatterns) {
       const match = userContent.match(pattern);
       if (match) {
+        const fn = toolMap[cmdTool];
+        const paramName = fn.parameters?.properties ? Object.keys(fn.parameters.properties)[0] : "command";
         calls.push({
           id: `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
           type: "function",
           function: {
-            name: cmdToolName,
-            arguments: JSON.stringify({ command: match[1].trim() }),
+            name: cmdTool,
+            arguments: JSON.stringify({ [paramName]: match[1].trim() }),
           },
         });
         return calls;
@@ -272,39 +293,69 @@ function inferToolCalls(responseText, tools, messages) {
     }
   }
 
-  // 检测项目结构/文件列表意图
-  if ((toolMap["run_command"] || toolMap["Bash"]) &&
-      /(?:项目结构|文件列表|目录|list.*files|tree|ls|检查.*结构|扫描)/i.test(userContent)) {
-    const cmdToolName = toolMap["run_command"] ? "run_command" : "Bash";
-    calls.push({
-      id: `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
-      type: "function",
-      function: {
-        name: cmdToolName,
-        arguments: JSON.stringify({ command: "find . -type f -not -path '*/node_modules/*' -not -path '*/.git/*' | head -50" }),
-      },
-    });
-    return calls;
+  // 检测项目结构/文件列表/检查/扫描意图
+  const structureIntent = /(?:项目结构|文件列表|目录|list.*files|tree|ls|检查.*项目|检查.*结构|扫描|做了什么|这个项目|项目.*做什么|what.*project|project.*structure|inspect)/i;
+  if (structureIntent.test(userContent)) {
+    if (cmdTool) {
+      const fn = toolMap[cmdTool];
+      const paramName = fn.parameters?.properties ? Object.keys(fn.parameters.properties)[0] : "command";
+      calls.push({
+        id: `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
+        type: "function",
+        function: {
+          name: cmdTool,
+          arguments: JSON.stringify({ [paramName]: "find . -type f -not -path '*/node_modules/*' -not -path '*/.git/*' | head -50" }),
+        },
+      });
+      return calls;
+    }
+    if (globTool) {
+      const fn = toolMap[globTool];
+      const paramName = fn.parameters?.properties ? Object.keys(fn.parameters.properties)[0] : "pattern";
+      calls.push({
+        id: `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
+        type: "function",
+        function: {
+          name: globTool,
+          arguments: JSON.stringify({ [paramName]: "**/*" }),
+        },
+      });
+      return calls;
+    }
   }
 
-  // 如果模型回复中包含 "无法" + "读取/访问/执行" 等拒绝词，且有匹配工具
-  // 说明模型拒绝了但我们应该帮它调用
-  if (/(?:无法|不能|cannot|can't).*(?:读取|访问|执行|read|access|run)/i.test(responseText)) {
-    // 通用文件读取推断
-    if (toolMap["read_file"] || toolMap["Read"]) {
+  // 如果模型回复中包含拒绝词，且用户消息中能提取到文件名
+  if (/(?:无法|不能|cannot|can't|没有|不支持|对话.*没有).*(?:读取|访问|执行|read|access|run|文件|目录|项目)/i.test(responseText)) {
+    // 尝试提取文件名
+    if (readTool) {
       const fileMatch = userContent.match(/[`"']?([a-zA-Z0-9_\-./\\]+\.[a-zA-Z0-9]+)[`"']?/);
       if (fileMatch) {
-        const readToolName = toolMap["read_file"] ? "read_file" : "Read";
+        const fn = toolMap[readTool];
+        const paramName = fn.parameters?.properties ? Object.keys(fn.parameters.properties)[0] : "path";
         calls.push({
           id: `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
           type: "function",
           function: {
-            name: readToolName,
-            arguments: JSON.stringify({ path: fileMatch[1] }),
+            name: readTool,
+            arguments: JSON.stringify({ [paramName]: fileMatch[1] }),
           },
         });
         return calls;
       }
+    }
+    // 如果没有具体文件名但有结构/项目相关意图，用命令工具
+    if (cmdTool && /(?:项目|结构|做了什么|检查)/i.test(userContent)) {
+      const fn = toolMap[cmdTool];
+      const paramName = fn.parameters?.properties ? Object.keys(fn.parameters.properties)[0] : "command";
+      calls.push({
+        id: `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
+        type: "function",
+        function: {
+          name: cmdTool,
+          arguments: JSON.stringify({ [paramName]: "ls -la && cat README.md 2>/dev/null || cat package.json 2>/dev/null" }),
+        },
+      });
+      return calls;
     }
   }
 
@@ -527,6 +578,12 @@ async function handleChatCompletions(req, res) {
   const tools = params.tools || [];
   const hasTools = tools.length > 0;
 
+  // 请求日志
+  const toolNamesList = tools.map(t => (t.function || t).name).join(", ");
+  const lastMsg = messages[messages.length - 1];
+  const lastContent = typeof lastMsg?.content === "string" ? lastMsg.content.slice(0, 80) : "[non-string]";
+  console.log(`[REQ] model=${model} stream=${stream} tools=[${toolNamesList}] msgs=${messages.length} last="${lastContent}"`);
+
   // 格式化消息（包含 tool 定义注入）
   const content = formatMessages(messages, tools);
 
@@ -626,12 +683,15 @@ async function handleChatCompletions(req, res) {
       if (hasTools) {
         toolCalls = parseToolCalls(fullContent);
         if (toolCalls.length > 0) {
+          console.log(`[TOOL] Parsed from model output: ${toolCalls.map(t=>t.function.name).join(", ")}`);
           responseContent = getContentWithoutToolCalls(fullContent) || null;
         } else {
-          // 模型未输出 <tool_call> 格式，尝试智能推断
           toolCalls = inferToolCalls(fullContent, tools, messages);
           if (toolCalls.length > 0) {
+            console.log(`[TOOL] Inferred: ${toolCalls.map(t=>t.function.name+"("+t.function.arguments+")").join(", ")}`);
             responseContent = null;
+          } else {
+            console.log(`[TOOL] No tool call detected. Response preview: ${fullContent.slice(0, 100)}`);
           }
         }
       }
