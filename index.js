@@ -70,8 +70,8 @@ class SessionPool {
   }
 
   async init(authToken, extraCookies, gptsId) {
-    // Step 1: Fetch existing proxy sessions from server
-    const existing = await this._fetchExistingSessions(authToken, extraCookies);
+    // Step 1: Fetch existing proxy sessions from server (matching gptsId)
+    const existing = await this._fetchExistingSessions(authToken, extraCookies, gptsId);
     console.log(`[Pool] Found ${existing.length} existing proxy-pool sessions on server`);
 
     // Step 2: Use existing sessions (up to pool size)
@@ -110,10 +110,9 @@ class SessionPool {
     }
   }
 
-  async _fetchExistingSessions(authToken, extraCookies) {
+  async _fetchExistingSessions(authToken, extraCookies, gptsId) {
     try {
       const headers = buildHeaders(authToken, extraCookies);
-      // GET request — no body
       const res = await httpsReq(
         `${NOAH_BASE}/api/noah-chat-svc/session/listSessionRecord?pageNo=1&pageSize=50`,
         { method: "GET", headers },
@@ -121,7 +120,7 @@ class SessionPool {
       );
       if (res.status === 200 && res.body?.code === 200 && Array.isArray(res.body.data)) {
         return res.body.data
-          .filter((r) => r.name && r.name.startsWith("proxy-pool-"))
+          .filter((r) => r.name && r.name.startsWith("proxy-pool-") && r.gptsId === gptsId)
           .map((r) => r.id)
           .filter(Boolean);
       }
