@@ -10,6 +10,8 @@
 const http = require("http");
 const https = require("https");
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 
 const PORT = parseInt(process.env.PORT || "4000", 10);
 const HOST = process.env.HOST || "127.0.0.1";
@@ -56,6 +58,8 @@ function httpsReq(url, opts, body) {
 
 // ─── Session Pool ───────────────────────────────────────────────────────────
 
+const POOL_FILE = path.join(__dirname, ".sessions.json");
+
 class SessionPool {
   constructor(size) {
     this.size = size;
@@ -65,28 +69,93 @@ class SessionPool {
   }
 
   async init(authToken, extraCookies, gptsId) {
-    console.log(`[Pool] Initializing ${this.size} sessions...`);
-    const results = await Promise.allSettled(
-      Array.from({ length: this.size }, (_, i) =>
-        this._createSession(authToken, extraCookies, gptsId, i)
-      )
-    );
+    // Step 1: Load persisted sessions
+    const saved = this._loadFromDisk();
+    console.log(`[Pool] Found ${saved.length} persisted sessions`);
 
-    for (let i = 0; i < results.length; i++) {
-      if (results[i].status === "fulfilled") {
-        this.sessions.push({ id: results[i].value, busy: false, createdAt: Date.now(), useCount: 0 });
-        console.log(`[Pool] Session ${i + 1}/${this.size} created: ${results[i].value}`);
-      } else {
-        console.error(`[Pool] Session ${i + 1}/${this.size} FAILED: ${results[i].reason?.message}`);
+    // Step 2: Validate persisted sessions are still alive
+    const valid = [];
+    if (saved.length > 0) {
+      console.log(`[Pool] Validating persisted sessions...`);
+      const checks = await Promise.allSettled(
+        saved.map((id) => this._validateSession(authToken, extraCookies, id))
+      );
+      for (let i = 0; i < checks.length; i++) {
+        if (checks[i].status === "fulfilled" && checks[i].value) {
+          valid.push(saved[i]);
+          console.log(`[Pool] Session ${saved[i]} — valid ✓`);
+        } else {
+          console.log(`[Pool] Session ${saved[i]} — invalid ✗ (will create new)`);
+        }
       }
     }
 
+    // Step 3: Add validated sessions to pool
+    for (const id of valid.slice(0, this.size)) {
+      this.sessions.push({ id, busy: false, createdAt: Date.now(), useCount: 0 });
+    }
+
+    // Step 4: Create missing sessions to fill the pool
+    const needed = this.size - this.sessions.length;
+    if (needed > 0) {
+      console.log(`[Pool] Creating ${needed} new sessions...`);
+      const results = await Promise.allSettled(
+        Array.from({ length: needed }, (_, i) =>
+          this._createSession(authToken, extraCookies, gptsId, this.sessions.length + i)
+        )
+      );
+      for (const r of results) {
+        if (r.status === "fulfilled") {
+          this.sessions.push({ id: r.value, busy: false, createdAt: Date.now(), useCount: 0 });
+          console.log(`[Pool] Created new session: ${r.value}`);
+        } else {
+          console.error(`[Pool] Create failed: ${r.reason?.message}`);
+        }
+      }
+    }
+
+    // Step 5: Persist to disk
+    this._saveToDisk();
+
     this.initialized = true;
-    console.log(`[Pool] Ready: ${this.sessions.length}/${this.size} sessions available`);
+    console.log(`[Pool] Ready: ${this.sessions.length}/${this.size} sessions`);
 
     if (this.sessions.length === 0) {
       throw new Error("Failed to create any sessions");
     }
+  }
+
+  _loadFromDisk() {
+    try {
+      if (fs.existsSync(POOL_FILE)) {
+        const data = JSON.parse(fs.readFileSync(POOL_FILE, "utf-8"));
+        if (Array.isArray(data.sessionIds)) return data.sessionIds;
+      }
+    } catch (err) {
+      console.warn(`[Pool] Failed to read ${POOL_FILE}: ${err.message}`);
+    }
+    return [];
+  }
+
+  _saveToDisk() {
+    try {
+      const data = { sessionIds: this.sessions.map((s) => s.id), updatedAt: new Date().toISOString() };
+      fs.writeFileSync(POOL_FILE, JSON.stringify(data, null, 2), "utf-8");
+      console.log(`[Pool] Persisted ${data.sessionIds.length} sessions to .sessions.json`);
+    } catch (err) {
+      console.warn(`[Pool] Failed to write ${POOL_FILE}: ${err.message}`);
+    }
+  }
+
+  async _validateSession(authToken, extraCookies, sessionId) {
+    // Use listChatRecord to verify the session still exists
+    const headers = buildHeaders(authToken, extraCookies);
+    const res = await httpsReq(
+      `${NOAH_BASE}/api/noah-chat-svc/chat/listChatRecord`,
+      { method: "POST", headers },
+      { offset: 0, sessionId, pageNo: 1, pageSize: 1 }
+    );
+    return res.status === 200 && res.body?.code === 200;
   }
 
   acquire() {
