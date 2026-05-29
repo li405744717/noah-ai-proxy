@@ -1,11 +1,11 @@
 /**
- * noah-ai-proxy v4.1 — OpenAI-compatible bridge via ai.noahgroup.com
+ * noah-ai-proxy v4.2 — OpenAI-compatible bridge via ai.noahgroup.com
  *
- * Architecture: Session pool + incremental messaging
- * - Fixed session pool (gptsId=76), same as v3
- * - Conversation→session affinity: same agent conversation reuses same session
- * - Only NEW messages sent each turn (session retains context server-side)
- * - Tool schema injected on first turn only
+ * Architecture: Session pool + chunked tool injection + incremental messaging
+ * - Fixed session pool (gptsId=76)
+ * - Tool schema split into chunks, injected sequentially on first turn
+ * - Each chunk stays under WAF size limit
+ * - Subsequent turns only send new messages
  */
 
 const http = require("http");
@@ -20,6 +20,7 @@ const NOAH_BASE = process.env.NOAH_BASE || "https://ai.noahgroup.com";
 const DEFAULT_MODEL = "gpt-5.5";
 const DEFAULT_GPTS_ID = parseInt(process.env.GPTS_ID || "76", 10);
 const POOL_SIZE = parseInt(process.env.POOL_SIZE || "10", 10);
+const MAX_CHUNK_BYTES = 12000; // Safe limit per request (WAF ~16KB, leave margin for JSON wrapper)
 
 // ─── Utility ────────────────────────────────────────────────────────────────
 
@@ -27,9 +28,8 @@ function uuid() { return crypto.randomUUID(); }
 function shortId() { return crypto.randomUUID().replace(/-/g, "").slice(0, 24); }
 
 function parseJwt(token) {
-  try {
-    return JSON.parse(Buffer.from(token.split(".")[1], "base64").toString());
-  } catch { return {}; }
+  try { return JSON.parse(Buffer.from(token.split(".")[1], "base64").toString()); }
+  catch { return {}; }
 }
 
 function md5(str) { return crypto.createHash("md5").update(str).digest("hex"); }
@@ -38,8 +38,7 @@ function httpsReq(url, opts, body) {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
     const reqOpts = {
-      hostname: u.hostname,
-      port: 443,
+      hostname: u.hostname, port: 443,
       path: u.pathname + u.search,
       method: opts.method || "POST",
       headers: opts.headers || {},
@@ -67,108 +66,79 @@ class SessionPool {
   constructor(size, prefix = "proxy-pool") {
     this.size = size;
     this.prefix = prefix;
-    this.sessions = [];       // [{id, busy, createdAt, useCount, convId, sentCount, fingerprint}]
+    this.sessions = []; // [{id, busy, useCount, convId, sentCount, fingerprint, toolsInjected}]
     this.waitQueue = [];
     this.initialized = false;
   }
 
   async init(authToken, extraCookies, gptsId) {
-    const existing = await this._fetchExistingSessions(authToken, extraCookies, gptsId);
-    console.log(`[Pool] Found ${existing.length} existing proxy-pool sessions on server`);
+    const existing = await this._fetchExisting(authToken, extraCookies, gptsId);
+    console.log(`[Pool] Found ${existing.length} existing sessions`);
 
     for (const id of existing.slice(0, this.size)) {
-      this.sessions.push({ id, busy: false, createdAt: Date.now(), useCount: 0, convId: null, sentCount: 0, fingerprint: null });
-      console.log(`[Pool] Reusing session: ${id}`);
+      this.sessions.push({ id, busy: false, useCount: 0, convId: null, sentCount: 0, fingerprint: null, toolsInjected: false });
     }
 
     const needed = this.size - this.sessions.length;
     if (needed > 0) {
       console.log(`[Pool] Creating ${needed} new sessions...`);
       const results = await Promise.allSettled(
-        Array.from({ length: needed }, (_, i) =>
-          this._createSession(authToken, extraCookies, gptsId, this.sessions.length + i)
-        )
+        Array.from({ length: needed }, (_, i) => this._create(authToken, extraCookies, gptsId, this.sessions.length + i))
       );
       for (const r of results) {
         if (r.status === "fulfilled") {
-          this.sessions.push({ id: r.value, busy: false, createdAt: Date.now(), useCount: 0, convId: null, sentCount: 0, fingerprint: null });
-          console.log(`[Pool] Created: ${r.value}`);
+          this.sessions.push({ id: r.value, busy: false, useCount: 0, convId: null, sentCount: 0, fingerprint: null, toolsInjected: false });
         } else {
           console.error(`[Pool] Create failed: ${r.reason?.message}`);
         }
       }
     }
 
-    this._saveToDisk();
+    this._save();
     this.initialized = true;
-    console.log(`[Pool] Ready: ${this.sessions.length}/${this.size} sessions`);
-    if (this.sessions.length === 0) throw new Error("Failed to create any sessions");
+    console.log(`[Pool] Ready: ${this.sessions.length}/${this.size}`);
+    if (this.sessions.length === 0) throw new Error("No sessions");
   }
 
-  // Acquire a session with conversation affinity
   acquire(convId, fingerprint) {
-    // 1. Look for a session already bound to this conversation
+    // 1. Same conversation, same fingerprint
     const bound = this.sessions.find(s => !s.busy && s.convId === convId && s.fingerprint === fingerprint);
-    if (bound) {
-      bound.busy = true;
-      bound.useCount++;
-      return Promise.resolve(bound);
-    }
+    if (bound) { bound.busy = true; bound.useCount++; return Promise.resolve(bound); }
 
-    // 2. If conversation fingerprint changed (reset), find the old binding and clear it
-    const stale = this.sessions.find(s => !s.busy && s.convId === convId && s.fingerprint !== fingerprint);
+    // 2. Same conv but reset
+    const stale = this.sessions.find(s => !s.busy && s.convId === convId);
     if (stale) {
-      console.log(`[Pool] Conv ${convId.slice(0,8)} reset detected, clearing session ${stale.id}`);
-      stale.convId = convId;
-      stale.fingerprint = fingerprint;
-      stale.sentCount = 0;
-      stale.busy = true;
-      stale.useCount++;
+      stale.fingerprint = fingerprint; stale.sentCount = 0; stale.toolsInjected = false;
+      stale.busy = true; stale.useCount++;
       return Promise.resolve(stale);
     }
 
-    // 3. Find any free unbound session
+    // 3. Free unbound
     const free = this.sessions.find(s => !s.busy && s.convId === null);
     if (free) {
-      free.convId = convId;
-      free.fingerprint = fingerprint;
-      free.busy = true;
-      free.useCount++;
+      free.convId = convId; free.fingerprint = fingerprint;
+      free.busy = true; free.useCount++;
       return Promise.resolve(free);
     }
 
-    // 4. Steal the least-recently-used free session (bound to a different conversation)
-    const lru = this.sessions
-      .filter(s => !s.busy)
-      .sort((a, b) => (a.useCount - b.useCount))[0];
+    // 4. LRU steal
+    const lru = this.sessions.filter(s => !s.busy).sort((a, b) => a.useCount - b.useCount)[0];
     if (lru) {
-      console.log(`[Pool] Stealing session ${lru.id} from conv ${(lru.convId || '').slice(0,8)} for conv ${convId.slice(0,8)}`);
-      lru.convId = convId;
-      lru.fingerprint = fingerprint;
-      lru.sentCount = 0; // Reset: new conversation on this session means context mismatch
-      lru.busy = true;
-      lru.useCount++;
+      lru.convId = convId; lru.fingerprint = fingerprint; lru.sentCount = 0; lru.toolsInjected = false;
+      lru.busy = true; lru.useCount++;
       return Promise.resolve(lru);
     }
 
-    // 5. All busy — queue
-    return new Promise((resolve) => {
-      this.waitQueue.push({ resolve, convId, fingerprint });
-    });
+    // 5. Wait
+    return new Promise(resolve => { this.waitQueue.push({ resolve, convId, fingerprint }); });
   }
 
   release(session) {
     session.busy = false;
     if (this.waitQueue.length > 0) {
       const { resolve, convId, fingerprint } = this.waitQueue.shift();
-      // Re-bind if needed
-      if (session.convId !== convId) {
-        session.convId = convId;
-        session.fingerprint = fingerprint;
-        session.sentCount = 0;
-      }
-      session.busy = true;
-      session.useCount++;
+      if (session.convId !== convId) { session.convId = convId; session.fingerprint = fingerprint; session.sentCount = 0; session.toolsInjected = false; }
+      session.busy = true; session.useCount++;
       resolve(session);
     }
   }
@@ -178,55 +148,43 @@ class SessionPool {
     return { total: this.sessions.length, busy, free: this.sessions.length - busy, waiting: this.waitQueue.length };
   }
 
-  async _fetchExistingSessions(authToken, extraCookies, gptsId) {
+  async _fetchExisting(authToken, extraCookies, gptsId) {
     try {
-      const headers = buildHeaders(authToken, extraCookies);
       const res = await httpsReq(
         `${NOAH_BASE}/api/noah-chat-svc/session/listSessionRecord?pageNo=1&pageSize=50`,
-        { method: "GET", headers }, null
+        { method: "GET", headers: buildHeaders(authToken, extraCookies) }, null
       );
       if (res.status === 200 && res.body?.code === 200 && Array.isArray(res.body.data)) {
-        return res.body.data
-          .filter(r => r.name && r.name.startsWith(`${this.prefix}-`) && r.gptsId === gptsId)
-          .map(r => r.id).filter(Boolean);
+        return res.body.data.filter(r => r.name?.startsWith(`${this.prefix}-`) && r.gptsId === gptsId).map(r => r.id).filter(Boolean);
       }
-      return this._loadFromDisk();
-    } catch (err) {
-      console.warn(`[Pool] Fetch failed: ${err.message}`);
-      return this._loadFromDisk();
-    }
+    } catch {}
+    return this._loadDisk();
   }
 
-  _loadFromDisk() {
+  _loadDisk() {
     try {
       if (fs.existsSync(POOL_FILE)) {
-        const data = JSON.parse(fs.readFileSync(POOL_FILE, "utf-8"));
-        if (Array.isArray(data.sessionIds)) return data.sessionIds;
+        const d = JSON.parse(fs.readFileSync(POOL_FILE, "utf-8"));
+        return d.sessionIds || [];
       }
     } catch {}
     return [];
   }
 
-  _saveToDisk() {
-    try {
-      fs.writeFileSync(POOL_FILE, JSON.stringify({
-        sessionIds: this.sessions.map(s => s.id),
-        updatedAt: new Date().toISOString()
-      }, null, 2), "utf-8");
-    } catch {}
+  _save() {
+    try { fs.writeFileSync(POOL_FILE, JSON.stringify({ sessionIds: this.sessions.map(s => s.id), updatedAt: new Date().toISOString() }, null, 2)); } catch {}
   }
 
-  async _createSession(authToken, extraCookies, gptsId, index) {
-    const headers = buildHeaders(authToken, extraCookies);
-    const body = { gptsId, sessionName: `${this.prefix}-${index}` };
+  async _create(authToken, extraCookies, gptsId, index) {
     const res = await httpsReq(
       `${NOAH_BASE}/api/noah-chat-svc/session/createSession`,
-      { method: "POST", headers }, body
+      { method: "POST", headers: buildHeaders(authToken, extraCookies) },
+      { gptsId, sessionName: `${this.prefix}-${index}` }
     );
     if (res.status === 200 && res.body?.code === 200 && res.body.data) {
       return res.body.data.sessionId || res.body.data.id || res.body.data;
     }
-    throw new Error(`createSession failed: ${JSON.stringify(res.body).slice(0, 200)}`);
+    throw new Error(`createSession: ${JSON.stringify(res.body).slice(0, 200)}`);
   }
 }
 
@@ -238,45 +196,48 @@ function buildHeaders(authToken, extraCookies) {
   return {
     "Content-Type": "application/json",
     Cookie: `NOAH_AI_AUTH_TOKEN=${authToken}${extraCookies ? "; " + extraCookies : ""}`,
-    Origin: NOAH_BASE,
-    Referer: `${NOAH_BASE}/home`,
-    "User-Agent": "Mozilla/5.0 (compatible; noah-ai-proxy/4.1)",
+    Origin: NOAH_BASE, Referer: `${NOAH_BASE}/home`,
+    "User-Agent": "Mozilla/5.0 (compatible; noah-ai-proxy/4.2)",
     "request-id": uuid(),
   };
 }
 
-async function callStreamChat(authToken, sessionId, content, model, extraCookies) {
+function streamChatBody(authToken, sessionId, content, model) {
   const tokenInfo = parseJwt(authToken);
   const workNo = tokenInfo.workNo || tokenInfo.userUid || "proxy";
+  return {
+    sessionId, chatType: 0, content,
+    currentGptsId: "", assistantType: 0,
+    model: model || DEFAULT_MODEL,
+    pluginIds: [2, 3], fileIds: [],
+    chatRequestId: `${workNo}${Date.now()}${Math.floor(Math.random() * 1000)}`,
+  };
+}
 
+async function callStreamChat(authToken, sessionId, content, model, extraCookies) {
   return httpsReq(
     `${NOAH_BASE}/api/noah-chat-svc/chat/streamChat`,
     { method: "POST", headers: buildHeaders(authToken, extraCookies), stream: true },
-    {
-      sessionId,
-      chatType: 0,
-      content,
-      currentGptsId: "",
-      assistantType: 0,
-      model: model || DEFAULT_MODEL,
-      pluginIds: [2, 3],
-      fileIds: [],
-      chatRequestId: `${workNo}${Date.now()}${Math.floor(Math.random() * 1000)}`,
-    }
+    streamChatBody(authToken, sessionId, content, model)
   );
+}
+
+// Send a message and wait for full response (used for tool schema injection)
+async function sendAndWait(authToken, sessionId, content, model, extraCookies) {
+  const upstream = await callStreamChat(authToken, sessionId, content, model, extraCookies);
+  if (upstream.statusCode >= 400) {
+    const body = await collectRawBody(upstream);
+    throw new Error(`upstream ${upstream.statusCode}: ${body.slice(0, 100)}`);
+  }
+  return collectResponse(upstream);
 }
 
 // ─── Noah SSE Parser ────────────────────────────────────────────────────────
 
 class NoahSSEParser {
   constructor({ onText, onDone, onError }) {
-    this.buffer = "";
-    this.onText = onText;
-    this.onDone = onDone;
-    this.onError = onError;
-    this.done = false;
+    this.buffer = ""; this.onText = onText; this.onDone = onDone; this.onError = onError; this.done = false;
   }
-
   feed(raw) {
     if (this.done) return;
     this.buffer += raw;
@@ -284,12 +245,7 @@ class NoahSSEParser {
     this.buffer = blocks.pop() || "";
     for (const block of blocks) this._parse(block.trim());
   }
-
-  flush() {
-    if (this.done) return;
-    if (this.buffer.trim()) { this._parse(this.buffer.trim()); this.buffer = ""; }
-  }
-
+  flush() { if (!this.done && this.buffer.trim()) { this._parse(this.buffer.trim()); this.buffer = ""; } }
   _parse(block) {
     if (!block || this.done) return;
     let eventType = "", dataLine = "";
@@ -297,9 +253,7 @@ class NoahSSEParser {
       if (line.startsWith("event:")) eventType = line.slice(6).trim();
       else if (line.startsWith("data:")) dataLine = line.slice(5).trim();
     }
-    if (eventType === "end" || eventType === "stop" || eventType === "done" || dataLine === "[DONE]") {
-      this.done = true; this.onDone(); return;
-    }
+    if (eventType === "end" || eventType === "stop" || eventType === "done" || dataLine === "[DONE]") { this.done = true; this.onDone(); return; }
     if (eventType === "error") { this.done = true; this.onError(new Error(dataLine || "upstream error")); return; }
     if (!dataLine) return;
     try {
@@ -313,74 +267,77 @@ class NoahSSEParser {
 // ─── OpenAI Format Builders ─────────────────────────────────────────────────
 
 function openaiChunk(id, model, content, finishReason) {
-  return {
-    id: `chatcmpl-${id}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model,
-    choices: [{ index: 0, delta: content !== null ? { content } : {}, finish_reason: finishReason || null }],
-  };
+  return { id: `chatcmpl-${id}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: content !== null ? { content } : {}, finish_reason: finishReason || null }] };
 }
 
 function openaiToolCallChunks(id, model, toolCalls) {
   const chunks = [];
   for (let i = 0; i < toolCalls.length; i++) {
     const tc = toolCalls[i];
-    chunks.push({
-      id: `chatcmpl-${id}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model,
-      choices: [{ index: 0, delta: { tool_calls: [{ index: i, id: tc.id, type: "function", function: { name: tc.function.name, arguments: "" } }] }, finish_reason: null }],
-    });
-    chunks.push({
-      id: `chatcmpl-${id}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model,
-      choices: [{ index: 0, delta: { tool_calls: [{ index: i, function: { arguments: tc.function.arguments } }] }, finish_reason: null }],
-    });
+    chunks.push({ id: `chatcmpl-${id}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { tool_calls: [{ index: i, id: tc.id, type: "function", function: { name: tc.function.name, arguments: "" } }] }, finish_reason: null }] });
+    chunks.push({ id: `chatcmpl-${id}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { tool_calls: [{ index: i, function: { arguments: tc.function.arguments } }] }, finish_reason: null }] });
   }
   return chunks;
 }
 
 function openaiResponse(id, model, content, toolCalls) {
   const message = { role: "assistant" };
-  if (toolCalls && toolCalls.length > 0) {
-    message.content = content || null;
-    message.tool_calls = toolCalls;
-  } else {
-    message.content = content;
-  }
-  return {
-    id: `chatcmpl-${id}`, object: "chat.completion", created: Math.floor(Date.now() / 1000), model,
-    choices: [{ index: 0, message, finish_reason: toolCalls?.length > 0 ? "tool_calls" : "stop" }],
-    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-  };
+  if (toolCalls && toolCalls.length > 0) { message.content = content || null; message.tool_calls = toolCalls; }
+  else { message.content = content; }
+  return { id: `chatcmpl-${id}`, object: "chat.completion", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, message, finish_reason: toolCalls?.length > 0 ? "tool_calls" : "stop" }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } };
 }
 
 // ─── Tool Calling Support ───────────────────────────────────────────────────
 
-const TOOL_SYSTEM_PROMPT = `[CRITICAL INSTRUCTION]
-You are in STRICT function-calling mode. Do NOT execute actions. Return ONLY <tool_call> blocks.
-Format:
+function buildToolSchemaChunks(tools) {
+  // Split tool definitions into chunks that fit under WAF limit
+  // Each chunk is a self-contained message
+  const header = `[SYSTEM CONFIGURATION - Function Definitions]
+You are in STRICT function-calling mode. Do NOT execute actions yourself.
+When the user gives a task, respond ONLY with <tool_call> blocks:
 <tool_call>
 {"name": "function_name", "arguments": {"param1": "value1"}}
 </tool_call>
-Rules: ONLY <tool_call> blocks. No text. Multiple calls = multiple blocks. If no function matches, reply in plain text.
-Available functions:
+Rules: ONLY <tool_call> blocks. No text. No explanations. Multiple calls = multiple blocks.
+If no function matches, reply in plain text.
+
+Here are the available functions (part PART_NUM of TOTAL_PARTS):
 `;
 
-const MAX_CONTENT_BYTES = 15000; // WAF limit ~16KB, leave margin
+  const chunks = [];
+  let currentTools = [];
+  let currentSize = 0;
+  const headerSize = Buffer.byteLength(header, 'utf-8');
 
-function buildToolSystemPrompt(tools, compact) {
-  if (!tools || !tools.length) return "";
-  let prompt = TOOL_SYSTEM_PROMPT;
   for (const tool of tools) {
     const fn = tool.function || tool;
-    if (compact) {
-      // Ultra-compact: just name + param names
-      const paramNames = fn.parameters?.properties ? Object.keys(fn.parameters.properties).join(", ") : "";
-      const required = fn.parameters?.required ? ` (required: ${fn.parameters.required.join(", ")})` : "";
-      prompt += `- ${fn.name}(${paramNames})${required}\n`;
-    } else {
-      prompt += `\n### ${fn.name}\n`;
-      if (fn.description) prompt += `${fn.description}\n`;
-      if (fn.parameters) prompt += `Parameters: ${JSON.stringify(fn.parameters)}\n`;
+    // Compact format for each tool
+    const paramNames = fn.parameters?.properties ? Object.keys(fn.parameters.properties).join(", ") : "";
+    const required = fn.parameters?.required ? fn.parameters.required.join(", ") : "";
+    let toolStr = `### ${fn.name}\n`;
+    if (fn.description) toolStr += `${fn.description.slice(0, 100)}\n`;
+    toolStr += `Params: ${paramNames}\n`;
+    if (required) toolStr += `Required: ${required}\n`;
+    toolStr += "\n";
+
+    const toolSize = Buffer.byteLength(toolStr, 'utf-8');
+
+    if (currentSize + toolSize + headerSize > MAX_CHUNK_BYTES && currentTools.length > 0) {
+      chunks.push(currentTools.join(""));
+      currentTools = [];
+      currentSize = 0;
     }
+    currentTools.push(toolStr);
+    currentSize += toolSize;
   }
-  return prompt;
+
+  if (currentTools.length > 0) chunks.push(currentTools.join(""));
+
+  // Add headers to each chunk
+  return chunks.map((body, i) => {
+    const h = header.replace("PART_NUM", String(i + 1)).replace("TOTAL_PARTS", String(chunks.length));
+    return h + body;
+  });
 }
 
 function parseToolCallsFromText(text) {
@@ -391,23 +348,17 @@ function parseToolCallsFromText(text) {
     try {
       const parsed = JSON.parse(m[1].trim());
       calls.push({
-        id: `call_${shortId()}`,
-        type: "function",
-        function: {
-          name: parsed.name,
-          arguments: typeof parsed.arguments === "string" ? parsed.arguments : JSON.stringify(parsed.arguments),
-        },
+        id: `call_${shortId()}`, type: "function",
+        function: { name: parsed.name, arguments: typeof parsed.arguments === "string" ? parsed.arguments : JSON.stringify(parsed.arguments) },
       });
     } catch {}
   }
   return calls;
 }
 
-function stripToolCalls(text) {
-  return text.replace(/<tool_call>\s*[\s\S]*?\s*<\/tool_call>/g, "").trim();
-}
+function stripToolCalls(text) { return text.replace(/<tool_call>\s*[\s\S]*?\s*<\/tool_call>/g, "").trim(); }
 
-// ─── Message Formatting (Incremental) ──────────────────────────────────────
+// ─── Message Formatting ────────────────────────────────────────────────────
 
 function extractText(msg) {
   if (typeof msg.content === "string") return msg.content;
@@ -416,59 +367,25 @@ function extractText(msg) {
 }
 
 function getConversationId(messages) {
-  const systemMsg = messages.find(m => m.role === "system");
-  const firstUser = messages.find(m => m.role === "user");
-  const key = (systemMsg ? extractText(systemMsg).slice(0, 200) : "") + "||" + (firstUser ? extractText(firstUser).slice(0, 100) : "");
-  return md5(key);
+  const sys = messages.find(m => m.role === "system");
+  const first = messages.find(m => m.role === "user");
+  return md5((sys ? extractText(sys).slice(0, 200) : "") + "||" + (first ? extractText(first).slice(0, 100) : ""));
 }
 
 function getFingerprint(messages) {
-  const first3 = messages.slice(0, 3).map(m => `${m.role}:${extractText(m).slice(0, 50)}`).join("|");
-  return md5(first3);
+  return md5(messages.slice(0, 3).map(m => `${m.role}:${extractText(m).slice(0, 50)}`).join("|"));
 }
 
-function formatIncrementalMessages(messages, tools, sentCount) {
-  const isFirstTurn = sentCount === 0;
+function formatUserMessages(messages, sentCount, hasTools, allMessages) {
   const newMessages = messages.slice(sentCount);
-
   if (newMessages.length === 0) return null;
 
-  const hasTools = tools && tools.length > 0;
-
-  // Try normal format first, fall back to compact if too large
-  const content = _buildContent(newMessages, tools, hasTools, isFirstTurn, messages, false);
-  const size = Buffer.byteLength(content, 'utf-8');
-
-  if (size <= MAX_CONTENT_BYTES) return content;
-
-  // Too large — try compact tool schema
-  console.log(`[Format] Content too large (${size}B), trying compact mode...`);
-  const compact = _buildContent(newMessages, tools, hasTools, isFirstTurn, messages, true);
-  const compactSize = Buffer.byteLength(compact, 'utf-8');
-
-  if (compactSize <= MAX_CONTENT_BYTES) {
-    console.log(`[Format] Compact mode OK (${compactSize}B)`);
-    return compact;
-  }
-
-  // Still too large — truncate: keep only system + last 5 messages
-  console.log(`[Format] Still too large (${compactSize}B), truncating to last 5 messages...`);
-  const truncMessages = newMessages.slice(-5);
-  const truncated = _buildContent(truncMessages, tools, hasTools, isFirstTurn, messages, true);
-  console.log(`[Format] Truncated to ${Buffer.byteLength(truncated, 'utf-8')}B`);
-  return truncated;
-}
-
-function _buildContent(newMessages, tools, hasTools, isFirstTurn, allMessages, compact) {
   const parts = [];
-
-  if (isFirstTurn && hasTools) {
-    parts.push(buildToolSystemPrompt(tools, compact));
-  }
 
   for (const msg of newMessages) {
     if (msg.role === "system") {
-      if (isFirstTurn) parts.push(`[System]\n${extractText(msg)}`);
+      // System message: include only if first turn
+      if (sentCount === 0) parts.push(`[System]\n${extractText(msg)}`);
     } else if (msg.role === "user") {
       parts.push(`[User]\n${extractText(msg)}`);
     } else if (msg.role === "assistant") {
@@ -479,23 +396,37 @@ function _buildContent(newMessages, tools, hasTools, isFirstTurn, allMessages, c
         }
       }
     } else if (msg.role === "tool") {
-      const content = msg.content || "";
-      // Truncate very long tool results
-      const truncContent = content.length > 500 ? content.slice(0, 500) + "...[truncated]" : content;
-      parts.push(`[Tool Result (${msg.name || msg.tool_call_id || "?"})]\n${truncContent}`);
+      const c = msg.content || "";
+      parts.push(`[Tool Result (${msg.name || msg.tool_call_id || "?"})]\n${c.length > 500 ? c.slice(0, 500) + "...[truncated]" : c}`);
     }
   }
 
   if (hasTools) {
     const lastMsg = allMessages[allMessages.length - 1];
     if (lastMsg && lastMsg.role === "tool") {
-      parts.push(`[Reminder] Tool finished. Output more <tool_call> if needed, or brief text summary if done.`);
+      parts.push(`[Reminder] Tool finished. Output more <tool_call> if needed, or brief summary if done.`);
     } else {
       parts.push(`[Reminder] Respond ONLY with <tool_call> blocks. Do NOT execute actions yourself.`);
     }
   }
 
-  return parts.join("\n\n");
+  const content = parts.join("\n\n");
+
+  // Safety check: if still too large, truncate to last few messages
+  if (Buffer.byteLength(content, 'utf-8') > MAX_CHUNK_BYTES) {
+    console.log(`[Format] User messages too large, taking last 3...`);
+    const last3 = newMessages.slice(-3);
+    const truncParts = [];
+    for (const msg of last3) {
+      if (msg.role === "user") truncParts.push(`[User]\n${extractText(msg)}`);
+      else if (msg.role === "assistant" && msg.content) truncParts.push(`[Assistant]\n${extractText(msg).slice(0, 200)}`);
+      else if (msg.role === "tool") truncParts.push(`[Tool Result]\n${(msg.content || "").slice(0, 200)}`);
+    }
+    if (hasTools) truncParts.push(`[Reminder] Respond ONLY with <tool_call> blocks.`);
+    return truncParts.join("\n\n");
+  }
+
+  return content;
 }
 
 // ─── Request Handler ────────────────────────────────────────────────────────
@@ -511,38 +442,48 @@ async function handleCompletions(reqBody, authToken, extraCookies, res) {
   const convId = getConversationId(messages);
   const fingerprint = getFingerprint(messages);
 
-  // Acquire session with affinity
   const session = await pool.acquire(convId, fingerprint);
-  const sentCount = session.sentCount;
-
-  // Format incremental content
-  const content = formatIncrementalMessages(messages, tools, sentCount);
-  if (!content) {
-    pool.release(session);
-    sendJson(res, 400, { error: { message: "No new message content", type: "invalid_request_error" } });
-    return;
-  }
-
-  const contentBytes = Buffer.byteLength(content, 'utf-8');
-  console.log(`[Req ${completionId}] conv=${convId.slice(0,8)} session=${session.id} sent=${sentCount}→${messages.length} size=${contentBytes}B model=${model} tools=${tools.length}`);
+  console.log(`[Req ${completionId}] conv=${convId.slice(0,8)} session=${session.id} sent=${session.sentCount} toolsInjected=${session.toolsInjected} msgs=${messages.length} tools=${tools.length}`);
 
   try {
+    // Step 1: Inject tool schema if not yet done for this session+conversation
+    if (hasTools && !session.toolsInjected) {
+      const chunks = buildToolSchemaChunks(tools);
+      console.log(`[Req ${completionId}] Injecting ${chunks.length} tool schema chunks...`);
+      for (let i = 0; i < chunks.length; i++) {
+        const chunkSize = Buffer.byteLength(chunks[i], 'utf-8');
+        console.log(`[Req ${completionId}]   chunk ${i+1}/${chunks.length}: ${chunkSize}B`);
+        await sendAndWait(authToken, session.id, chunks[i], model, extraCookies);
+      }
+      session.toolsInjected = true;
+      console.log(`[Req ${completionId}] Tool schema injection complete`);
+    }
+
+    // Step 2: Send actual user messages (incremental)
+    const content = formatUserMessages(messages, session.sentCount, hasTools, messages);
+    if (!content) {
+      pool.release(session);
+      sendJson(res, 400, { error: { message: "No new messages", type: "invalid_request_error" } });
+      return;
+    }
+
+    const contentBytes = Buffer.byteLength(content, 'utf-8');
+    console.log(`[Req ${completionId}] Sending ${contentBytes}B (msgs ${session.sentCount}→${messages.length})`);
+
     const upstream = await callStreamChat(authToken, session.id, content, model, extraCookies);
     console.log(`[Req ${completionId}] upstream status=${upstream.statusCode}`);
 
     if (upstream.statusCode >= 400) {
       const errBody = await collectRawBody(upstream);
-      console.log(`[Req ${completionId}] upstream error (first 200): ${errBody.slice(0, 200)}`);
+      console.log(`[Req ${completionId}] upstream error: ${errBody.slice(0, 200)}`);
       pool.release(session);
       sendJson(res, 502, { error: { message: `Upstream ${upstream.statusCode}`, type: "upstream_error" } });
       return;
     }
 
     if (stream && !hasTools) {
-      res.writeHead(200, {
-        "Content-Type": "text/event-stream", "Cache-Control": "no-cache",
-        Connection: "keep-alive", "Access-Control-Allow-Origin": "*", "X-Accel-Buffering": "no",
-      });
+      // Pure streaming (no tool parsing needed)
+      res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive", "Access-Control-Allow-Origin": "*", "X-Accel-Buffering": "no" });
       writeSse(res, { id: `chatcmpl-${completionId}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
 
       const parser = new NoahSSEParser({
@@ -550,17 +491,17 @@ async function handleCompletions(reqBody, authToken, extraCookies, res) {
         onDone: () => { session.sentCount = messages.length; pool.release(session); finishStream(res, completionId, model); },
         onError: (err) => { pool.release(session); if (!res.writableEnded) { writeSse(res, { error: { message: err.message } }); res.write("data: [DONE]\n\n"); res.end(); } },
       });
-
       upstream.on("data", (chunk) => parser.feed(chunk.toString("utf-8")));
       upstream.on("end", () => { parser.flush(); if (!parser.done) { session.sentCount = messages.length; pool.release(session); finishStream(res, completionId, model); } });
       upstream.on("error", (err) => { pool.release(session); if (!res.writableEnded) { writeSse(res, { error: { message: err.message } }); res.end(); } });
 
     } else {
+      // Collect full response for tool parsing
       const fullText = await collectResponse(upstream);
       session.sentCount = messages.length;
       pool.release(session);
 
-      console.log(`[Req ${completionId}] collected ${fullText.length} chars: ${fullText.slice(0, 150)}${fullText.length > 150 ? '...' : ''}`);
+      console.log(`[Req ${completionId}] response: ${fullText.length} chars: ${fullText.slice(0, 150)}${fullText.length > 150 ? '...' : ''}`);
 
       let toolCalls = [];
       let responseContent = fullText;
@@ -596,48 +537,44 @@ async function handleCompletions(reqBody, authToken, extraCookies, res) {
 
 function collectResponse(upstream) {
   return new Promise((resolve, reject) => {
-    let full = "";
-    let resolved = false;
-    let rawChunks = [];
+    let full = "", resolved = false, rawChunks = [];
     const done = (src) => {
-      if (!resolved) {
-        resolved = true;
-        if (full.length === 0 && rawChunks.length > 0) {
-          const raw = rawChunks.join('');
-          console.log(`[collectResponse] empty response, RAW (first 300): ${raw.slice(0, 300)}`);
-          try {
-            const errBody = JSON.parse(raw);
-            if (errBody.code && errBody.code !== 200) { reject(new Error(`upstream: ${errBody.msg || raw.slice(0, 100)}`)); return; }
-          } catch {}
-        }
-        resolve(full);
+      if (resolved) return;
+      resolved = true;
+      if (full.length === 0 && rawChunks.length > 0) {
+        const raw = rawChunks.join('');
+        console.log(`[collectResponse] empty, RAW: ${raw.slice(0, 300)}`);
+        try {
+          const e = JSON.parse(raw);
+          if (e.code && e.code !== 200) { reject(new Error(`upstream: ${e.msg || raw.slice(0, 100)}`)); return; }
+        } catch {}
       }
+      resolve(full);
     };
     const parser = new NoahSSEParser({
-      onText: (text) => { full += text; },
-      onDone: () => { done("sse-done"); },
-      onError: (err) => { if (!resolved) { resolved = true; reject(err); } },
+      onText: (t) => { full += t; },
+      onDone: () => { done("sse"); },
+      onError: (e) => { if (!resolved) { resolved = true; reject(e); } },
     });
-    upstream.on("data", (chunk) => { const s = chunk.toString("utf-8"); rawChunks.push(s); parser.feed(s); });
-    upstream.on("end", () => { parser.flush(); done("stream-end"); });
-    upstream.on("error", (err) => { if (!resolved) { resolved = true; reject(err); } });
+    upstream.on("data", (c) => { const s = c.toString("utf-8"); rawChunks.push(s); parser.feed(s); });
+    upstream.on("end", () => { parser.flush(); done("end"); });
+    upstream.on("error", (e) => { if (!resolved) { resolved = true; reject(e); } });
   });
 }
 
 function collectRawBody(stream) {
-  return new Promise((resolve) => {
-    let data = "";
-    stream.on("data", (c) => (data += c.toString("utf-8")));
-    stream.on("end", () => resolve(data));
-    stream.on("error", () => resolve(data));
+  return new Promise(resolve => {
+    let d = "";
+    stream.on("data", c => (d += c.toString("utf-8")));
+    stream.on("end", () => resolve(d));
+    stream.on("error", () => resolve(d));
   });
 }
 
 function finishStream(res, id, model) {
   if (res.writableEnded) return;
   writeSse(res, openaiChunk(id, model, null, "stop"));
-  res.write("data: [DONE]\n\n");
-  res.end();
+  res.write("data: [DONE]\n\n"); res.end();
 }
 
 function writeSse(res, data) { res.write(`data: ${JSON.stringify(data)}\n\n`); }
@@ -659,7 +596,7 @@ const server = http.createServer(async (req, res) => {
 
   if (url === "/v1/chat/completions" && req.method === "POST") {
     let body = "";
-    await new Promise((r) => { req.on("data", (c) => (body += c)); req.on("end", r); });
+    await new Promise(r => { req.on("data", c => (body += c)); req.on("end", r); });
 
     let params;
     try { params = JSON.parse(body); }
@@ -686,23 +623,20 @@ const server = http.createServer(async (req, res) => {
     }
 
   } else if (url === "/v1/models" && req.method === "GET") {
-    sendJson(res, 200, {
-      object: "list",
-      data: [
-        { id: "gpt-5.3", object: "model", created: 1700000000, owned_by: "noah-ai" },
-        { id: "gpt-5.5", object: "model", created: 1700000000, owned_by: "noah-ai" },
-        { id: "gpt-5.4", object: "model", created: 1700000000, owned_by: "noah-ai" },
-        { id: "gpt-5.5-thinking", object: "model", created: 1700000000, owned_by: "noah-ai" },
-        { id: "gemini-3", object: "model", created: 1700000000, owned_by: "noah-ai" },
-        { id: "doubao-pro", object: "model", created: 1700000000, owned_by: "noah-ai" },
-        { id: "claude", object: "model", created: 1700000000, owned_by: "noah-ai" },
-        { id: "us.anthropic.claude-opus-4-7", object: "model", created: 1700000000, owned_by: "noah-ai" },
-        { id: "Qwen-27B", object: "model", created: 1700000000, owned_by: "noah-ai" },
-      ],
-    });
+    sendJson(res, 200, { object: "list", data: [
+      { id: "gpt-5.3", object: "model", created: 1700000000, owned_by: "noah-ai" },
+      { id: "gpt-5.5", object: "model", created: 1700000000, owned_by: "noah-ai" },
+      { id: "gpt-5.4", object: "model", created: 1700000000, owned_by: "noah-ai" },
+      { id: "gpt-5.5-thinking", object: "model", created: 1700000000, owned_by: "noah-ai" },
+      { id: "gemini-3", object: "model", created: 1700000000, owned_by: "noah-ai" },
+      { id: "doubao-pro", object: "model", created: 1700000000, owned_by: "noah-ai" },
+      { id: "claude", object: "model", created: 1700000000, owned_by: "noah-ai" },
+      { id: "us.anthropic.claude-opus-4-7", object: "model", created: 1700000000, owned_by: "noah-ai" },
+      { id: "Qwen-27B", object: "model", created: 1700000000, owned_by: "noah-ai" },
+    ]});
 
   } else if (url === "/health" || url === "/pool") {
-    sendJson(res, 200, { status: "ok", version: "4.1.0", upstream: NOAH_BASE, pool: pool.stats() });
+    sendJson(res, 200, { status: "ok", version: "4.2.0", upstream: NOAH_BASE, pool: pool.stats() });
 
   } else {
     sendJson(res, 404, { error: { message: "Not found", type: "invalid_request_error" } });
@@ -713,34 +647,22 @@ const server = http.createServer(async (req, res) => {
 
 async function main() {
   const authToken = process.env.NOAH_AUTH_TOKEN;
-  if (!authToken) {
-    console.error("[Fatal] NOAH_AUTH_TOKEN environment variable is required");
-    process.exit(1);
-  }
-
+  if (!authToken) { console.error("[Fatal] NOAH_AUTH_TOKEN required"); process.exit(1); }
   const extraCookies = process.env.NOAH_EXTRA_COOKIES || "";
 
-  try {
-    await pool.init(authToken, extraCookies, DEFAULT_GPTS_ID);
-  } catch (err) {
-    console.error(`[Fatal] Pool init failed: ${err.message}`);
-    process.exit(1);
-  }
+  try { await pool.init(authToken, extraCookies, DEFAULT_GPTS_ID); }
+  catch (err) { console.error(`[Fatal] Pool init: ${err.message}`); process.exit(1); }
 
   server.listen(PORT, HOST, () => {
-    console.log(`\nnoah-ai-proxy v4.1 — Pool + Incremental Messaging`);
+    console.log(`\nnoah-ai-proxy v4.2 — Chunked Tool Injection`);
     console.log(`Listening: http://${HOST}:${PORT}`);
     console.log(`Upstream:  ${NOAH_BASE}`);
     console.log(`Pool:      ${pool.sessions.length} sessions (gptsId=${DEFAULT_GPTS_ID})`);
-    console.log(`Default model: ${DEFAULT_MODEL}`);
-    console.log(`\nEndpoints:`);
-    console.log(`  POST /v1/chat/completions`);
-    console.log(`  GET  /v1/models`);
-    console.log(`  GET  /health`);
+    console.log(`Max chunk: ${MAX_CHUNK_BYTES}B`);
+    console.log(`Default model: ${DEFAULT_MODEL}\n`);
   });
 }
 
 main();
-
 process.on("SIGTERM", () => { server.close(); process.exit(0); });
 process.on("SIGINT", () => { server.close(); process.exit(0); });
