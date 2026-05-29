@@ -1,6 +1,7 @@
-const express = require("express");
 const http = require("http");
+const https = require("https");
 const { v4: uuidv4 } = require("uuid");
+const express = require("express");
 const config = require("./config");
 
 const app = express();
@@ -23,66 +24,144 @@ app.get("/v1/models", (req, res) => {
   res.json({
     object: "list",
     data: [
-      { id: "claude-agent", object: "model", created: Date.now(), owned_by: "noah-ai-proxy" },
+      { id: "claude-opus-4-6", object: "model", created: Date.now(), owned_by: "noah-ai-proxy" },
       { id: "claude-sonnet-4-6", object: "model", created: Date.now(), owned_by: "noah-ai-proxy" },
-      { id: "claude-opus-4-6", object: "model", created: Date.now(), owned_by: "noah-ai-proxy" }
+      { id: "claude-agent", object: "model", created: Date.now(), owned_by: "noah-ai-proxy" }
     ]
   });
 });
 
 app.post("/v1/chat/completions", async (req, res) => {
   const { messages, stream, model } = req.body;
-
   const prompt = messagesToPrompt(messages);
-  const runId = `run_${uuidv4().replace(/-/g, "")}`;
 
-  const sidecarPayload = {
-    run_id: runId,
-    prompt,
-    workspace_path: config.defaults.workspacePath,
-    claude_home_path: config.defaults.claudeHomePath,
-    permission_mode: config.defaults.permissionMode,
-    session_mode: config.defaults.sessionMode,
-    timeout_ms: config.defaults.timeoutMs,
-    allowed_tools: [],
-    settings_sources: [],
-    skills_whitelist: [],
-    skills_source_dirs: [],
-    use_shared_nas: true
-  };
+  try {
+    const runData = await createRun(prompt);
+    const runId = runData.runId;
 
-  if (stream) {
-    await handleStream(req, res, sidecarPayload, model);
-  } else {
-    await handleNonStream(req, res, sidecarPayload, model);
+    if (stream) {
+      await handleStream(res, runId, model);
+    } else {
+      await handleNonStream(res, runId, model);
+    }
+  } catch (err) {
+    if (!res.headersSent) {
+      res.status(500).json({ error: { message: err.message, type: "server_error" } });
+    }
   }
 });
 
 function messagesToPrompt(messages) {
   if (!messages || messages.length === 0) return "";
-  const last = messages[messages.length - 1];
-  if (messages.length === 1) {
-    return extractContent(last);
-  }
-  const parts = messages.map((m) => {
+  if (messages.length === 1) return extractContent(messages[0]);
+  return messages.map((m) => {
     const role = m.role === "assistant" ? "Assistant" : m.role === "system" ? "System" : "Human";
     return `${role}: ${extractContent(m)}`;
-  });
-  return parts.join("\n\n");
+  }).join("\n\n");
 }
 
 function extractContent(msg) {
   if (typeof msg.content === "string") return msg.content;
   if (Array.isArray(msg.content)) {
-    return msg.content
-      .filter((p) => p.type === "text")
-      .map((p) => p.text)
-      .join("\n");
+    return msg.content.filter((p) => p.type === "text").map((p) => p.text).join("\n");
   }
   return String(msg.content || "");
 }
 
-async function handleStream(req, res, payload, model) {
+function createRun(prompt) {
+  return new Promise((resolve, reject) => {
+    const boundary = `----FormBoundary${uuidv4().replace(/-/g, "")}`;
+    const fields = {
+      prompt,
+      sessionId: "new",
+      idempotencyKey: `idem_${uuidv4().replace(/-/g, "")}`,
+      session_mode: "one_shot"
+    };
+
+    let body = "";
+    for (const [key, value] of Object.entries(fields)) {
+      body += `--${boundary}\r\n`;
+      body += `Content-Disposition: form-data; name="${key}"\r\n\r\n`;
+      body += `${value}\r\n`;
+    }
+    body += `--${boundary}--\r\n`;
+
+    const url = new URL(`${config.gateway.baseUrl}/v1/runs`);
+    const isHttps = url.protocol === "https:";
+    const transport = isHttps ? https : http;
+
+    const options = {
+      hostname: url.hostname,
+      port: url.port || (isHttps ? 443 : 80),
+      path: url.pathname,
+      method: "POST",
+      headers: {
+        "Content-Type": `multipart/form-data; boundary=${boundary}`,
+        "Content-Length": Buffer.byteLength(body),
+        "GW-USER-ID": config.gateway.userId,
+        "GW-TENANT-ID": config.gateway.tenantId,
+        ...config.gateway.extraHeaders
+      },
+      rejectUnauthorized: false
+    };
+
+    const req = transport.request(options, (response) => {
+      let data = "";
+      response.on("data", (chunk) => (data += chunk));
+      response.on("end", () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.code === 200 && parsed.data) {
+            resolve(parsed.data);
+          } else {
+            reject(new Error(`Gateway createRun failed: ${parsed.message || data}`));
+          }
+        } catch (e) {
+          reject(new Error(`Gateway response parse error: ${data.slice(0, 200)}`));
+        }
+      });
+    });
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+function streamEvents(runId) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(`${config.gateway.baseUrl}/v1/runs/events`);
+    const isHttps = url.protocol === "https:";
+    const transport = isHttps ? https : http;
+
+    const options = {
+      hostname: url.hostname,
+      port: url.port || (isHttps ? 443 : 80),
+      path: `${url.pathname}?runId=${encodeURIComponent(runId)}`,
+      method: "POST",
+      headers: {
+        "GW-USER-ID": config.gateway.userId,
+        "GW-TENANT-ID": config.gateway.tenantId,
+        "Accept": "text/event-stream",
+        ...config.gateway.extraHeaders
+      },
+      rejectUnauthorized: false
+    };
+
+    const req = transport.request(options, (response) => {
+      if (response.statusCode !== 200) {
+        let body = "";
+        response.on("data", (c) => (body += c));
+        response.on("end", () => reject(new Error(`Events endpoint returned ${response.statusCode}: ${body}`)));
+        return;
+      }
+      resolve(response);
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+async function handleStream(res, runId, model) {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
@@ -91,195 +170,167 @@ async function handleStream(req, res, payload, model) {
   const chatId = `chatcmpl-${uuidv4().replace(/-/g, "")}`;
   const created = Math.floor(Date.now() / 1000);
 
-  try {
-    const sseStream = await callSidecarStream(payload);
-    let buffer = "";
+  const sseStream = await streamEvents(runId);
+  let buffer = "";
 
-    sseStream.on("data", (chunk) => {
-      buffer += chunk.toString();
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
+  sseStream.on("data", (chunk) => {
+    buffer += chunk.toString();
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
 
-      for (const line of lines) {
-        if (line.startsWith("data: [DONE]")) {
-          const doneChunk = {
-            id: chatId,
-            object: "chat.completion.chunk",
-            created,
-            model: model || "claude-agent",
-            choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
-          };
-          res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
-          res.write("data: [DONE]\n\n");
-          res.end();
-          return;
-        }
+    for (const line of lines) {
+      if (line.startsWith("data:")) {
+        const jsonStr = line.slice(5).trim();
+        if (!jsonStr) continue;
+        try {
+          const event = JSON.parse(jsonStr);
+          const text = extractTextDelta(event);
+          if (text) {
+            const chunk = {
+              id: chatId,
+              object: "chat.completion.chunk",
+              created,
+              model: model || "claude-agent",
+              choices: [{ index: 0, delta: { content: text }, finish_reason: null }]
+            };
+            res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+          }
 
-        if (line.startsWith("data: ")) {
-          const jsonStr = line.slice(6);
-          try {
-            const event = JSON.parse(jsonStr);
-            const text = extractTextFromSseEvent(event);
-            if (text) {
-              const chunk = {
-                id: chatId,
-                object: "chat.completion.chunk",
-                created,
-                model: model || "claude-agent",
-                choices: [{ index: 0, delta: { content: text }, finish_reason: null }]
-              };
-              res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-            }
-          } catch {}
-        }
+          if (isRunComplete(event)) {
+            const doneChunk = {
+              id: chatId,
+              object: "chat.completion.chunk",
+              created,
+              model: model || "claude-agent",
+              choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
+            };
+            res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
+            res.write("data: [DONE]\n\n");
+            res.end();
+            return;
+          }
+        } catch {}
       }
-    });
+    }
+  });
 
-    sseStream.on("end", () => {
-      if (!res.writableEnded) {
-        const doneChunk = {
-          id: chatId,
-          object: "chat.completion.chunk",
-          created,
-          model: model || "claude-agent",
-          choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
-        };
-        res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
-        res.write("data: [DONE]\n\n");
-        res.end();
-      }
-    });
+  sseStream.on("end", () => {
+    if (!res.writableEnded) {
+      const doneChunk = {
+        id: chatId,
+        object: "chat.completion.chunk",
+        created,
+        model: model || "claude-agent",
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
+      };
+      res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
+      res.write("data: [DONE]\n\n");
+      res.end();
+    }
+  });
 
-    sseStream.on("error", (err) => {
-      if (!res.writableEnded) {
-        res.write(`data: ${JSON.stringify({ error: { message: err.message } })}\n\n`);
-        res.end();
-      }
-    });
-  } catch (err) {
+  sseStream.on("error", (err) => {
     if (!res.writableEnded) {
       res.write(`data: ${JSON.stringify({ error: { message: err.message } })}\n\n`);
       res.end();
     }
-  }
-}
-
-async function handleNonStream(req, res, payload, model) {
-  try {
-    const result = await callSidecarNonStream(payload);
-    const chatId = `chatcmpl-${uuidv4().replace(/-/g, "")}`;
-    res.json({
-      id: chatId,
-      object: "chat.completion",
-      created: Math.floor(Date.now() / 1000),
-      model: model || "claude-agent",
-      choices: [{
-        index: 0,
-        message: { role: "assistant", content: result },
-        finish_reason: "stop"
-      }],
-      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-    });
-  } catch (err) {
-    res.status(500).json({ error: { message: err.message, type: "server_error" } });
-  }
-}
-
-function callSidecarStream(payload) {
-  return new Promise((resolve, reject) => {
-    const url = new URL(`${config.sidecar.baseUrl}/runs/stream`);
-    const postData = JSON.stringify(payload);
-
-    const options = {
-      hostname: url.hostname,
-      port: url.port,
-      path: url.pathname,
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Content-Length": Buffer.byteLength(postData)
-      }
-    };
-
-    if (config.sidecar.apiKey) {
-      options.headers["x-api-key"] = config.sidecar.apiKey;
-    }
-
-    const req = http.request(options, (response) => {
-      if (response.statusCode !== 200) {
-        let body = "";
-        response.on("data", (c) => (body += c));
-        response.on("end", () => reject(new Error(`Sidecar returned ${response.statusCode}: ${body}`)));
-        return;
-      }
-      resolve(response);
-    });
-
-    req.on("error", reject);
-    req.write(postData);
-    req.end();
   });
 }
 
-function callSidecarNonStream(payload) {
-  return new Promise((resolve, reject) => {
-    const stream = callSidecarStream(payload);
-    stream
-      .then((response) => {
-        let buffer = "";
-        let resultText = "";
+async function handleNonStream(res, runId, model) {
+  const sseStream = await streamEvents(runId);
+  let buffer = "";
+  let resultText = "";
 
-        response.on("data", (chunk) => {
-          buffer += chunk.toString();
-          const lines = buffer.split("\n");
-          buffer = lines.pop() || "";
+  sseStream.on("data", (chunk) => {
+    buffer += chunk.toString();
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
 
-          for (const line of lines) {
-            if (line.startsWith("data: ") && !line.startsWith("data: [DONE]")) {
-              try {
-                const event = JSON.parse(line.slice(6));
-                if (event.type === "result" && event.result) {
-                  resultText = event.result;
-                } else {
-                  const text = extractTextFromSseEvent(event);
-                  if (text) resultText += text;
-                }
-              } catch {}
+    for (const line of lines) {
+      if (line.startsWith("data:")) {
+        const jsonStr = line.slice(5).trim();
+        if (!jsonStr) continue;
+        try {
+          const event = JSON.parse(jsonStr);
+          if (event.type === "assistant" && event.subtype === "text_delta") {
+            const content = event.message?.content;
+            if (Array.isArray(content)) {
+              for (const block of content) {
+                if (block.type === "text") resultText += block.text;
+              }
             }
+          } else if (event.type === "stream_event") {
+            const delta = event.event?.delta;
+            if (delta?.type === "text_delta" && delta.text) {
+              resultText += delta.text;
+            }
+          } else if (event.type === "result" && event.result) {
+            resultText = event.result;
           }
-        });
+        } catch {}
+      }
+    }
+  });
 
-        response.on("end", () => resolve(resultText || "(no response)"));
-        response.on("error", reject);
-      })
-      .catch(reject);
+  return new Promise((resolve) => {
+    sseStream.on("end", () => {
+      const chatId = `chatcmpl-${uuidv4().replace(/-/g, "")}`;
+      res.json({
+        id: chatId,
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: model || "claude-agent",
+        choices: [{
+          index: 0,
+          message: { role: "assistant", content: resultText || "(no response)" },
+          finish_reason: "stop"
+        }],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+      });
+      resolve();
+    });
+
+    sseStream.on("error", (err) => {
+      if (!res.headersSent) {
+        res.status(500).json({ error: { message: err.message, type: "server_error" } });
+      }
+      resolve();
+    });
   });
 }
 
-function extractTextFromSseEvent(event) {
+function extractTextDelta(event) {
   if (event.type === "assistant" && event.subtype === "text_delta") {
     const content = event.message?.content;
     if (Array.isArray(content)) {
-      return content
-        .filter((block) => block.type === "text")
-        .map((block) => block.text)
-        .join("");
+      return content.filter((b) => b.type === "text").map((b) => b.text).join("");
     }
-    if (typeof event.message === "string") return event.message;
   }
-  if (event.type === "result" && event.result) {
-    return null;
+  if (event.type === "stream_event") {
+    const delta = event.event?.delta;
+    if (delta?.type === "text_delta" && delta.text) {
+      return delta.text;
+    }
   }
   return "";
 }
 
+function isRunComplete(event) {
+  if (event.type === "result") return true;
+  if (event.status === "completed" || event.status === "failed" || event.status === "canceled") return true;
+  if (event.type === "stream_event" && event.event?.type === "message_stop") return true;
+  return false;
+}
+
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", version: "1.0.0", upstream: config.sidecar.baseUrl });
+  res.json({ status: "ok", version: "2.0.0", gateway: config.gateway.baseUrl });
 });
 
 const server = app.listen(config.port, config.host, () => {
-  console.log(`noah-ai-proxy listening on ${config.host}:${config.port}`);
-  console.log(`Upstream sidecar: ${config.sidecar.baseUrl}`);
+  console.log(`noah-ai-proxy v2 listening on ${config.host}:${config.port}`);
+  console.log(`Gateway: ${config.gateway.baseUrl}`);
+  console.log(`User: ${config.gateway.userId}`);
   console.log(`Auth: ${config.auth.apiKey ? "enabled" : "disabled"}`);
 });
 

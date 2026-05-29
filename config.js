@@ -1,23 +1,27 @@
-const path = require("path");
-
 module.exports = {
   port: parseInt(process.env.PROXY_PORT || "4000", 10),
   host: process.env.PROXY_HOST || "127.0.0.1",
 
-  sidecar: {
-    baseUrl: process.env.SIDECAR_URL || "http://127.0.0.1:4319",
-    apiKey: process.env.SIDECAR_API_KEY || ""
-  },
-
-  defaults: {
-    workspacePath: process.env.WORKSPACE_PATH || "/var/lib/agent-gw/sessions/proxy-workspace",
-    claudeHomePath: process.env.CLAUDE_HOME_PATH || "/var/lib/agent-gw/sessions/proxy-workspace/.claude",
-    permissionMode: process.env.PERMISSION_MODE || "acceptEdits",
-    sessionMode: process.env.SESSION_MODE || "one_shot",
-    timeoutMs: parseInt(process.env.TIMEOUT_MS || "120000", 10)
+  gateway: {
+    baseUrl: process.env.GATEWAY_URL || "http://127.0.0.1:8090",
+    userId: process.env.GW_USER_ID || "proxy-user",
+    tenantId: process.env.GW_TENANT_ID || "default",
+    extraHeaders: parseHeaders(process.env.GW_EXTRA_HEADERS || "")
   },
 
   auth: {
     apiKey: process.env.PROXY_API_KEY || ""
   }
 };
+
+function parseHeaders(str) {
+  if (!str) return {};
+  const headers = {};
+  for (const pair of str.split(";")) {
+    const [key, ...rest] = pair.split(":");
+    if (key && rest.length) {
+      headers[key.trim()] = rest.join(":").trim();
+    }
+  }
+  return headers;
+}
