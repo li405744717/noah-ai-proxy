@@ -1,11 +1,9 @@
 /**
- * noah-ai-proxy v4.4 — OpenAI-compatible bridge via ai.noahgroup.com
+ * noah-ai-proxy v4.5 — OpenAI-compatible bridge via ai.noahgroup.com
  *
- * v4.3 improvements over v4.2:
- * - Smart prompt deduplication: system prompt + tools only sent once per session
- * - Conversation identity based on system prompt hash (stable across turns)
- * - sentCount properly tracks what Noah already has in context
- * - Tool schema fingerprint: only re-inject if tools actually change
+ * v4.5: read auth from local .auth.json (gitignored) instead of env var
+ * v4.4: system prompt chunking for 32KB+ prompts
+ * v4.3: smart prompt deduplication, conversation identity, sentCount tracking
  */
 
 const http = require("http");
@@ -21,6 +19,20 @@ const DEFAULT_MODEL = "gpt-5.5";
 const DEFAULT_GPTS_ID = parseInt(process.env.GPTS_ID || "76", 10);
 const POOL_SIZE = parseInt(process.env.POOL_SIZE || "10", 10);
 const MAX_CHUNK_BYTES = 12000;
+const AUTH_FILE = path.join(__dirname, ".auth.json");
+
+function loadAuth() {
+  try {
+    const raw = fs.readFileSync(AUTH_FILE, "utf-8");
+    const data = JSON.parse(raw);
+    return {
+      token: data.token || data.NOAH_AUTH_TOKEN || "",
+      extraCookies: data.extraCookies || data.extra_cookies || ""
+    };
+  } catch {
+    return { token: process.env.NOAH_AUTH_TOKEN || "", extraCookies: process.env.NOAH_EXTRA_COOKIES || "" };
+  }
+}
 
 // ─── Utility ────────────────────────────────────────────────────────────────
 
@@ -80,16 +92,12 @@ class SessionPool {
   }
 
   acquire(convId) {
-    // 1. Same conversation (reuse context)
     const bound = this.sessions.find(s => !s.busy && s.convId === convId);
     if (bound) { bound.busy = true; bound.useCount++; return Promise.resolve(bound); }
-    // 2. Free unbound
     const free = this.sessions.find(s => !s.busy && s.convId === null);
     if (free) { free.convId = convId; free.busy = true; free.useCount++; return Promise.resolve(free); }
-    // 3. LRU steal
     const lru = this.sessions.filter(s => !s.busy).sort((a, b) => a.useCount - b.useCount)[0];
     if (lru) { lru.convId = convId; lru.sentCount = 0; lru.systemHash = null; lru.toolsHash = null; lru.toolsInjected = false; lru.busy = true; lru.useCount++; return Promise.resolve(lru); }
-    // 4. Wait
     return new Promise(resolve => { this.waitQueue.push({ resolve, convId }); });
   }
 
@@ -158,7 +166,6 @@ async function sendAndStop(authToken, sessionId, content, model, extraCookies) {
     const body = await collectRawBody(upstream);
     throw new Error(`upstream ${upstream.statusCode}: ${body.slice(0, 100)}`);
   }
-  // Message is now in session context. Stop the generation immediately.
   await new Promise(r => setTimeout(r, 300));
   try { await stopStream(authToken, sessionId, chatRequestId, extraCookies); } catch(e) { console.log(`[stop] warn: ${e.message}`); }
   upstream.destroy();
@@ -290,45 +297,29 @@ function extractText(msg) {
   return String(msg.content || "");
 }
 
-/**
- * v4.3 key change: Conversation identity is based on system prompt hash.
- * This is stable across all turns of the same agent conversation.
- */
 function getConversationId(messages) {
   const sys = messages.find(m => m.role === "system");
   return md5(sys ? extractText(sys) : "no-system");
 }
 
-/**
- * v4.3: Only send messages that Noah doesn't already have.
- * 
- * Agent pattern: every request sends [system, user1, asst1, tool1, user2, asst2, tool2, ..., userN]
- * Noah session already has all messages up to sentCount.
- * We only need to send messages[sentCount:] — but skip system (already sent in first turn).
- */
 function formatNewMessages(messages, sentCount, hasTools, includeSystem) {
-  // First turn: include system prompt only if small (v4.4)
   if (sentCount === 0) {
     const parts = [];
     if (includeSystem) { const sys = messages.find(m => m.role === "system"); if (sys) parts.push(`以下是我的工作背景：\n${extractText(sys)}`); }
-    
-    // Include all non-system messages
     for (const msg of messages) {
       if (msg.role === "system") continue;
       parts.push(formatSingleMessage(msg));
     }
-    
     if (hasTools) parts.push(getToolReminder(messages));
     return joinAndTruncate(parts);
   }
   
-  // Subsequent turns: only new messages (skip system + already-sent)
   const newMessages = messages.slice(sentCount);
   if (newMessages.length === 0) return null;
   
   const parts = [];
   for (const msg of newMessages) {
-    if (msg.role === "system") continue; // Never re-send system prompt
+    if (msg.role === "system") continue;
     parts.push(formatSingleMessage(msg));
   }
   
@@ -367,9 +358,8 @@ function getToolReminder(messages) {
 function joinAndTruncate(parts) {
   const content = parts.filter(Boolean).join("\n\n");
   if (Buffer.byteLength(content, 'utf-8') > MAX_CHUNK_BYTES) {
-    // Keep system (if present) + last 3 messages + reminder
     console.log(`[Format] Content too large (${Buffer.byteLength(content, 'utf-8')}B), truncating...`);
-    const keep = parts.slice(0, 1).concat(parts.slice(-4)); // first (system) + last 4 (including reminder)
+    const keep = parts.slice(0, 1).concat(parts.slice(-4));
     return keep.filter(Boolean).join("\n\n");
   }
   return content;
@@ -390,13 +380,11 @@ async function handleCompletions(reqBody, authToken, extraCookies, res) {
 
   const session = await pool.acquire(convId);
   
-  // Check if tools changed (agent might update tool definitions mid-conversation)
   const needToolReinject = hasTools && (!session.toolsInjected || session.toolsHash !== toolsHash);
   
   console.log(`[${completionId}] conv=${convId.slice(0,8)} sess=${session.id} sent=${session.sentCount} tools=${tools.length} needInject=${needToolReinject}`);
 
   try {
-    // Step 1: Inject system prompt if large (v4.4)
     const sysMsg = messages.find(m => m.role === "system");
     const sysText = sysMsg ? extractText(sysMsg) : "";
     const sysHash = sysText ? md5(sysText) : null;
@@ -417,7 +405,6 @@ async function handleCompletions(reqBody, authToken, extraCookies, res) {
       session.systemInjected = true; session.systemHash = sysHash;
     }
 
-    // Step 2: Inject tool schema if needed
     if (needToolReinject) {
       const chunks = buildToolSchemaChunks(tools);
       console.log(`[${completionId}] Injecting ${chunks.length} tool schema chunk(s)...`);
@@ -430,8 +417,6 @@ async function handleCompletions(reqBody, authToken, extraCookies, res) {
       console.log(`[${completionId}] Tool schema injection complete`);
     }
 
-    // Step 3: Format and send only NEW messages
-    // v4.4 fix: detect new conversation reusing same system prompt
     if (session.sentCount > 0 && session.sentCount >= messages.length) {
       console.log(`[${completionId}] sentCount(${session.sentCount}) >= msgs(${messages.length}), resetting`);
       session.sentCount = 0;
@@ -452,7 +437,6 @@ async function handleCompletions(reqBody, authToken, extraCookies, res) {
     if (upstream.statusCode >= 400) {
       const errBody = await collectRawBody(upstream);
       console.log(`[${completionId}] upstream error ${upstream.statusCode}: ${errBody.slice(0, 200)}`);
-      // If 405 (WAF), try resetting session
       if (upstream.statusCode === 405) {
         console.log(`[${completionId}] WAF block detected, resetting session state`);
         session.sentCount = 0; session.toolsInjected = false; session.toolsHash = null;
@@ -463,7 +447,6 @@ async function handleCompletions(reqBody, authToken, extraCookies, res) {
     }
 
     if (stream && !hasTools) {
-      // Pure streaming (no tool parsing)
       res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive", "Access-Control-Allow-Origin": "*", "X-Accel-Buffering": "no" });
       writeSse(res, { id: `chatcmpl-${completionId}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
       const parser = new NoahSSEParser({
@@ -475,7 +458,6 @@ async function handleCompletions(reqBody, authToken, extraCookies, res) {
       upstream.on("end", () => { parser.flush(); if (!parser.done) { session.sentCount = messages.length; pool.release(session); finishStream(res, completionId, model); } });
       upstream.on("error", (err) => { pool.release(session); if (!res.writableEnded) { writeSse(res, { error: { message: err.message } }); res.end(); } });
     } else {
-      // Collect response (needed for tool call parsing)
       const fullText = await collectResponse(upstream);
       session.sentCount = messages.length;
       pool.release(session);
@@ -540,10 +522,11 @@ const server = http.createServer(async (req, res) => {
     await new Promise(r => { req.on("data", c => (body += c)); req.on("end", r); });
     let params;
     try { params = JSON.parse(body); } catch { sendJson(res, 400, { error: { message: "Invalid JSON" } }); return; }
-    const authToken = process.env.NOAH_AUTH_TOKEN || "";
-    if (!authToken) { sendJson(res, 401, { error: { message: "Missing NOAH_AUTH_TOKEN" } }); return; }
+    const auth = loadAuth();
+    const authToken = auth.token;
+    if (!authToken) { sendJson(res, 401, { error: { message: "Missing token in .auth.json" } }); return; }
     if (!pool.initialized) { sendJson(res, 503, { error: { message: "Pool not ready" } }); return; }
-    const extraCookies = req.headers["x-extra-cookies"] || params.extra_cookies || process.env.NOAH_EXTRA_COOKIES || "";
+    const extraCookies = req.headers["x-extra-cookies"] || params.extra_cookies || auth.extraCookies || "";
     try { await handleCompletions(params, authToken, extraCookies, res); } catch (err) { console.error(`[Error] ${err.message}`); if (!res.headersSent) sendJson(res, 500, { error: { message: err.message } }); }
 
   } else if (url === "/v1/models" && req.method === "GET") {
@@ -557,7 +540,7 @@ const server = http.createServer(async (req, res) => {
     ]});
 
   } else if (url === "/health" || url === "/pool") {
-    sendJson(res, 200, { status: "ok", version: "4.3.0", upstream: NOAH_BASE, pool: pool.stats() });
+    sendJson(res, 200, { status: "ok", version: "4.5.0", upstream: NOAH_BASE, pool: pool.stats() });
   } else {
     sendJson(res, 404, { error: { message: "Not found" } });
   }
@@ -566,12 +549,14 @@ const server = http.createServer(async (req, res) => {
 // ─── Startup ────────────────────────────────────────────────────────────────
 
 async function main() {
-  const authToken = process.env.NOAH_AUTH_TOKEN;
-  if (!authToken) { console.error("[Fatal] NOAH_AUTH_TOKEN required. Set via environment variable."); process.exit(1); }
-  const extraCookies = process.env.NOAH_EXTRA_COOKIES || "";
+  const auth = loadAuth();
+  const authToken = auth.token;
+  if (!authToken) { console.error("[Fatal] No token found. Create .auth.json with {\"token\": \"your-jwt\"} or set NOAH_AUTH_TOKEN env var."); process.exit(1); }
+  const extraCookies = auth.extraCookies;
+  console.log(`[Auth] Loaded token from ${fs.existsSync(AUTH_FILE) ? '.auth.json' : 'env'} (${authToken.slice(0,20)}...)`);
   try { await pool.init(authToken, extraCookies, DEFAULT_GPTS_ID); } catch (err) { console.error(`[Fatal] Pool init: ${err.message}`); process.exit(1); }
   server.listen(PORT, HOST, () => {
-    console.log(`\nnoah-ai-proxy v4.4 — Smart Deduplication`);
+    console.log(`\nnoah-ai-proxy v4.5 — Auth from .auth.json`);
     console.log(`Listening: http://${HOST}:${PORT}`);
     console.log(`Upstream:  ${NOAH_BASE}`);
     console.log(`Pool:      ${pool.sessions.length} sessions (gptsId=${DEFAULT_GPTS_ID})`);

@@ -1,0 +1,4 @@
+{
+  "token": "eyJhbGciOiJIUzI1NiJ9.your-jwt-token-here",
+  "extraCookies": ""
+}
