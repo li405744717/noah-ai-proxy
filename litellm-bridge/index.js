@@ -12,10 +12,11 @@ const crypto = require("crypto");
 const PORT = parseInt(process.env.PORT || "4100", 10);
 const HOST = process.env.HOST || "127.0.0.1";
 const REGION = process.env.BEDROCK_REGION || "us-east-1";
-const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "us.anthropic.claude-sonnet-4-6-v1";
+const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "us.anthropic.claude-opus-4-7-v1";
 const MAX_TOKENS = 8192;
 
 const MODEL_MAP = {
+  "claude-opus-4-7": "us.anthropic.claude-opus-4-7-v1",
   "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1",
   "claude-opus-4-5": "us.anthropic.claude-opus-4-5-v1",
   "claude-sonnet-4-6": "us.anthropic.claude-sonnet-4-6-v1",
