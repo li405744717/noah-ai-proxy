@@ -1,12 +1,11 @@
 /**
- * noah-ai-proxy v3.0 — OpenAI-compatible bridge via ai.noahgroup.com
+ * noah-ai-proxy v4.0 — OpenAI-compatible bridge via ai.noahgroup.com
  *
- * Features:
- * - Single session pool (gptsId=76 "纯净版", obeys tool_call format)
- * - Model pass-through (supports native model IDs like us.anthropic.claude-opus-4-7)
- * - Tool calling via prompt injection (works reliably with pure LLM sessions)
- * - Concurrent request handling with pool-based session allocation
- * - Full OpenAI Chat Completions API compatibility
+ * v4 Architecture: Incremental messaging with session affinity
+ * - Each agent conversation maps to a dedicated Noah session
+ * - Only NEW messages are sent each turn (Noah session retains context)
+ * - Tool schema injected once on first turn, not repeated
+ * - Reset detection: if conversation diverges, auto-create new session
  */
 
 const http = require("http");
@@ -20,7 +19,6 @@ const HOST = process.env.HOST || "127.0.0.1";
 const NOAH_BASE = process.env.NOAH_BASE || "https://ai.noahgroup.com";
 const DEFAULT_MODEL = "gpt-5.5";
 const DEFAULT_GPTS_ID = parseInt(process.env.GPTS_ID || "76", 10);
-const POOL_SIZE = parseInt(process.env.POOL_SIZE || "10", 10);
 
 // ─── Utility ────────────────────────────────────────────────────────────────
 
@@ -32,6 +30,8 @@ function parseJwt(token) {
     return JSON.parse(Buffer.from(token.split(".")[1], "base64").toString());
   } catch { return {}; }
 }
+
+function md5(str) { return crypto.createHash("md5").update(str).digest("hex"); }
 
 function httpsReq(url, opts, body) {
   return new Promise((resolve, reject) => {
@@ -58,155 +58,144 @@ function httpsReq(url, opts, body) {
   });
 }
 
-// ─── Session Pool ───────────────────────────────────────────────────────────
+// ─── Conversation Session Manager ──────────────────────────────────────────
+// Maps agent conversations to Noah sessions, tracks message state
 
-const POOL_FILE = path.join(__dirname, ".sessions.json");
+const CONV_FILE = path.join(__dirname, ".conversations.json");
 
-class SessionPool {
-  constructor(size, prefix = "proxy-pool") {
-    this.size = size;
-    this.prefix = prefix;
-    this.sessions = [];       // [{id, busy, createdAt, useCount}]
-    this.waitQueue = [];      // callbacks waiting for a free session
-    this.initialized = false;
+class ConversationManager {
+  constructor() {
+    // convId → { noahSessionId, sentCount, fingerprint, createdAt, lastUsed, busy }
+    this.conversations = new Map();
+    this.waitQueues = new Map(); // convId → [resolve callbacks]
+    this._load();
   }
 
-  async init(authToken, extraCookies, gptsId) {
-    // Step 1: Fetch existing proxy sessions from server (matching gptsId)
-    const existing = await this._fetchExistingSessions(authToken, extraCookies, gptsId);
-    console.log(`[Pool] Found ${existing.length} existing proxy-pool sessions on server`);
-
-    // Step 2: Use existing sessions (up to pool size)
-    for (const id of existing.slice(0, this.size)) {
-      this.sessions.push({ id, busy: false, createdAt: Date.now(), useCount: 0 });
-      console.log(`[Pool] Reusing session: ${id}`);
-    }
-
-    // Step 3: Create missing sessions to fill the pool
-    const needed = this.size - this.sessions.length;
-    if (needed > 0) {
-      console.log(`[Pool] Creating ${needed} new sessions...`);
-      const results = await Promise.allSettled(
-        Array.from({ length: needed }, (_, i) =>
-          this._createSession(authToken, extraCookies, gptsId, this.sessions.length + i)
-        )
-      );
-      for (const r of results) {
-        if (r.status === "fulfilled") {
-          this.sessions.push({ id: r.value, busy: false, createdAt: Date.now(), useCount: 0 });
-          console.log(`[Pool] Created new session: ${r.value}`);
-        } else {
-          console.error(`[Pool] Create failed: ${r.reason?.message}`);
-        }
-      }
-    }
-
-    // Step 4: Persist to local file as fallback
-    this._saveToDisk();
-
-    this.initialized = true;
-    console.log(`[Pool] Ready: ${this.sessions.length}/${this.size} sessions`);
-
-    if (this.sessions.length === 0) {
-      throw new Error("Failed to create any sessions");
-    }
-  }
-
-  async _fetchExistingSessions(authToken, extraCookies, gptsId) {
+  _load() {
     try {
-      const headers = buildHeaders(authToken, extraCookies);
-      const res = await httpsReq(
-        `${NOAH_BASE}/api/noah-chat-svc/session/listSessionRecord?pageNo=1&pageSize=50`,
-        { method: "GET", headers },
-        null
-      );
-      if (res.status === 200 && res.body?.code === 200 && Array.isArray(res.body.data)) {
-        return res.body.data
-          .filter((r) => r.name && r.name.startsWith(`${this.prefix}-`) && r.gptsId === gptsId)
-          .map((r) => r.id)
-          .filter(Boolean);
-      }
-      return this._loadFromDisk();
-    } catch (err) {
-      console.warn(`[Pool] Failed to fetch sessions from server: ${err.message}`);
-      return this._loadFromDisk();
-    }
-  }
-
-  _loadFromDisk() {
-    try {
-      if (fs.existsSync(POOL_FILE)) {
-        const data = JSON.parse(fs.readFileSync(POOL_FILE, "utf-8"));
-        if (Array.isArray(data.sessionIds)) {
-          console.log(`[Pool] Loaded ${data.sessionIds.length} sessions from local fallback`);
-          return data.sessionIds;
+      if (fs.existsSync(CONV_FILE)) {
+        const data = JSON.parse(fs.readFileSync(CONV_FILE, "utf-8"));
+        if (data.conversations) {
+          for (const [k, v] of Object.entries(data.conversations)) {
+            this.conversations.set(k, { ...v, busy: false });
+          }
+          console.log(`[ConvMgr] Loaded ${this.conversations.size} conversation mappings`);
         }
       }
     } catch (err) {
-      console.warn(`[Pool] Failed to read ${POOL_FILE}: ${err.message}`);
+      console.warn(`[ConvMgr] Failed to load: ${err.message}`);
     }
-    return [];
   }
 
-  _saveToDisk() {
+  _save() {
     try {
-      const data = { sessionIds: this.sessions.map((s) => s.id), updatedAt: new Date().toISOString() };
-      fs.writeFileSync(POOL_FILE, JSON.stringify(data, null, 2), "utf-8");
-    } catch (err) {
-      console.warn(`[Pool] Failed to write ${POOL_FILE}: ${err.message}`);
-    }
+      const obj = {};
+      for (const [k, v] of this.conversations) {
+        obj[k] = { noahSessionId: v.noahSessionId, sentCount: v.sentCount, fingerprint: v.fingerprint, createdAt: v.createdAt, lastUsed: v.lastUsed };
+      }
+      fs.writeFileSync(CONV_FILE, JSON.stringify({ conversations: obj, updatedAt: new Date().toISOString() }, null, 2), "utf-8");
+    } catch {}
   }
 
-  acquire() {
-    const free = this.sessions.find((s) => !s.busy);
-    if (free) {
-      free.busy = true;
-      free.useCount++;
-      return Promise.resolve(free);
-    }
-    // All busy — queue the request
-    return new Promise((resolve) => {
-      this.waitQueue.push(resolve);
-    });
+  getConversationId(messages) {
+    // Use system message + first user message as conversation identity
+    const systemMsg = messages.find(m => m.role === "system");
+    const firstUser = messages.find(m => m.role === "user");
+    const key = (systemMsg ? extractText(systemMsg) : "") + "||" + (firstUser ? extractText(firstUser).slice(0, 100) : "");
+    return md5(key);
   }
 
-  release(session) {
-    session.busy = false;
-    // If someone is waiting, give them this session immediately
-    if (this.waitQueue.length > 0) {
-      const next = this.waitQueue.shift();
-      session.busy = true;
-      session.useCount++;
-      next(session);
-    }
+  getFingerprint(messages) {
+    // Fingerprint = hash of first 3 messages to detect conversation reset
+    const first3 = messages.slice(0, 3).map(m => `${m.role}:${extractText(m).slice(0, 50)}`).join("|");
+    return md5(first3);
   }
 
-  stats() {
-    const busy = this.sessions.filter((s) => s.busy).length;
-    return {
-      total: this.sessions.length,
-      busy,
-      free: this.sessions.length - busy,
-      waiting: this.waitQueue.length,
+  async acquire(convId, messages, authToken, extraCookies) {
+    const existing = this.conversations.get(convId);
+    const fingerprint = this.getFingerprint(messages);
+
+    if (existing && existing.fingerprint === fingerprint && !existing.busy) {
+      existing.busy = true;
+      existing.lastUsed = Date.now();
+      return existing;
+    }
+
+    if (existing && existing.fingerprint === fingerprint && existing.busy) {
+      // Same conversation, but busy — wait
+      return new Promise((resolve) => {
+        if (!this.waitQueues.has(convId)) this.waitQueues.set(convId, []);
+        this.waitQueues.get(convId).push(resolve);
+      });
+    }
+
+    // New conversation or fingerprint changed (conversation reset)
+    if (existing && existing.fingerprint !== fingerprint) {
+      console.log(`[ConvMgr] Conversation ${convId.slice(0,8)} reset detected, creating new session`);
+    }
+
+    // Create new Noah session for this conversation
+    const noahSessionId = await this._createSession(authToken, extraCookies, convId);
+    const conv = {
+      noahSessionId,
+      sentCount: 0,
+      fingerprint,
+      createdAt: Date.now(),
+      lastUsed: Date.now(),
+      busy: true,
     };
+    this.conversations.set(convId, conv);
+    this._save();
+    return conv;
   }
 
-  async _createSession(authToken, extraCookies, gptsId, index) {
+  release(convId) {
+    const conv = this.conversations.get(convId);
+    if (!conv) return;
+    conv.busy = false;
+    this._save();
+
+    // Wake up waiting requests for this conversation
+    const queue = this.waitQueues.get(convId);
+    if (queue && queue.length > 0) {
+      const next = queue.shift();
+      conv.busy = true;
+      next(conv);
+    }
+  }
+
+  updateSentCount(convId, count) {
+    const conv = this.conversations.get(convId);
+    if (conv) {
+      conv.sentCount = count;
+      this._save();
+    }
+  }
+
+  async _createSession(authToken, extraCookies, convId) {
     const headers = buildHeaders(authToken, extraCookies);
-    const body = { gptsId, sessionName: `${this.prefix}-${index}` };
+    const body = { gptsId: DEFAULT_GPTS_ID, sessionName: `conv-${convId.slice(0, 8)}` };
     const res = await httpsReq(
       `${NOAH_BASE}/api/noah-chat-svc/session/createSession`,
       { method: "POST", headers },
       body
     );
     if (res.status === 200 && res.body?.code === 200 && res.body.data) {
-      return res.body.data.sessionId || res.body.data.id || res.body.data;
+      const id = res.body.data.sessionId || res.body.data.id || res.body.data;
+      console.log(`[ConvMgr] Created session ${id} for conv ${convId.slice(0,8)}`);
+      return id;
     }
     throw new Error(`createSession failed: ${JSON.stringify(res.body).slice(0, 200)}`);
   }
+
+  stats() {
+    let busy = 0;
+    for (const v of this.conversations.values()) { if (v.busy) busy++; }
+    return { total: this.conversations.size, busy, free: this.conversations.size - busy };
+  }
 }
 
-const pool = new SessionPool(POOL_SIZE, "proxy-pool");
+const convMgr = new ConversationManager();
 
 // ─── Noah AI API ────────────────────────────────────────────────────────────
 
@@ -216,7 +205,7 @@ function buildHeaders(authToken, extraCookies) {
     Cookie: `NOAH_AI_AUTH_TOKEN=${authToken}${extraCookies ? "; " + extraCookies : ""}`,
     Origin: NOAH_BASE,
     Referer: `${NOAH_BASE}/home`,
-    "User-Agent": "Mozilla/5.0 (compatible; noah-ai-proxy/2.1)",
+    "User-Agent": "Mozilla/5.0 (compatible; noah-ai-proxy/4.0)",
     "request-id": uuid(),
   };
 }
@@ -390,21 +379,40 @@ function stripToolCalls(text) {
   return text.replace(/<tool_call>\s*[\s\S]*?\s*<\/tool_call>/g, "").trim();
 }
 
-// ─── Message Formatting ─────────────────────────────────────────────────────
+// ─── Incremental Message Formatting ────────────────────────────────────────
 
-function formatMessages(messages, tools) {
+function extractText(msg) {
+  if (typeof msg.content === "string") return msg.content;
+  if (Array.isArray(msg.content)) return msg.content.filter((p) => p.type === "text").map((p) => p.text).join("\n");
+  return String(msg.content || "");
+}
+
+function formatIncrementalMessages(messages, tools, sentCount) {
+  // First turn: send tool schema + all messages
+  // Subsequent turns: only send new messages since last sentCount
+  const isFirstTurn = sentCount === 0;
+  const newMessages = messages.slice(sentCount);
+
+  if (newMessages.length === 0) {
+    return { content: null, newSentCount: sentCount };
+  }
+
   const parts = [];
   const hasTools = tools && tools.length > 0;
 
-  if (hasTools) {
+  // Only inject tool schema on first turn
+  if (isFirstTurn && hasTools) {
     parts.push(buildToolSystemPrompt(tools));
   }
 
-  for (const msg of messages) {
-    if (msg.role === "system") parts.push(`[System]\n${extractText(msg)}`);
-    else if (msg.role === "user") parts.push(`[User]\n${extractText(msg)}`);
-    else if (msg.role === "assistant") {
-      if (msg.content) parts.push(`[Assistant]\n${msg.content}`);
+  for (const msg of newMessages) {
+    if (msg.role === "system") {
+      if (isFirstTurn) parts.push(`[System]\n${extractText(msg)}`);
+      // Skip system messages on subsequent turns (already in session context)
+    } else if (msg.role === "user") {
+      parts.push(`[User]\n${extractText(msg)}`);
+    } else if (msg.role === "assistant") {
+      if (msg.content) parts.push(`[Assistant]\n${typeof msg.content === 'string' ? msg.content : extractText(msg)}`);
       if (msg.tool_calls) {
         for (const tc of msg.tool_calls) {
           parts.push(`[Assistant Tool Call]\n<tool_call>\n{"name":"${tc.function.name}","arguments":${tc.function.arguments}}\n</tool_call>`);
@@ -415,6 +423,7 @@ function formatMessages(messages, tools) {
     }
   }
 
+  // Add reminder based on context
   if (hasTools) {
     const lastMsg = messages[messages.length - 1];
     if (lastMsg && lastMsg.role === "tool") {
@@ -423,17 +432,11 @@ function formatMessages(messages, tools) {
 - If the task is complete, provide a brief text summary of what was accomplished.
 Do NOT execute actions yourself. Only use <tool_call> blocks for actions.`);
     } else {
-      parts.push(`[Reminder] You MUST NOT execute the task yourself. Do NOT create files, run code, or use workspace tools. Analyze the user's intent and respond ONLY with <tool_call> blocks matching the available functions above. Output nothing else.`);
+      parts.push(`[Reminder] Respond ONLY with <tool_call> blocks matching the available functions. Do NOT execute actions yourself. Output nothing else unless no function matches.`);
     }
   }
 
-  return parts.join("\n\n");
-}
-
-function extractText(msg) {
-  if (typeof msg.content === "string") return msg.content;
-  if (Array.isArray(msg.content)) return msg.content.filter((p) => p.type === "text").map((p) => p.text).join("\n");
-  return String(msg.content || "");
+  return { content: parts.join("\n\n"), newSentCount: messages.length };
 }
 
 // ─── Request Handler ────────────────────────────────────────────────────────
@@ -445,16 +448,36 @@ async function handleCompletions(reqBody, authToken, extraCookies, res) {
   const tools = reqBody.tools || [];
   const hasTools = tools.length > 0;
 
-  const content = formatMessages(messages, tools);
-  if (!content) { sendJson(res, 400, { error: { message: "No message content", type: "invalid_request_error" } }); return; }
-
   const completionId = shortId();
-  const session = await pool.acquire();
-  console.log(`[Req ${completionId}] session=${session.id} model=${model} hasTools=${hasTools}`);
+  const convId = convMgr.getConversationId(messages);
+
+  // Acquire conversation session
+  const conv = await convMgr.acquire(convId, messages, authToken, extraCookies);
+  console.log(`[Req ${completionId}] conv=${convId.slice(0,8)} session=${conv.noahSessionId} sentCount=${conv.sentCount}→${messages.length} model=${model} hasTools=${hasTools}`);
+
+  // Format only incremental messages
+  const { content, newSentCount } = formatIncrementalMessages(messages, tools, conv.sentCount);
+
+  if (!content) {
+    convMgr.release(convId);
+    sendJson(res, 400, { error: { message: "No new message content", type: "invalid_request_error" } });
+    return;
+  }
+
+  const contentSize = Buffer.byteLength(content, 'utf-8');
+  console.log(`[Req ${completionId}] sending ${contentSize} bytes (incremental: msgs ${conv.sentCount}→${newSentCount})`);
 
   try {
-    const upstream = await callStreamChat(authToken, session.id, content, model, extraCookies);
+    const upstream = await callStreamChat(authToken, conv.noahSessionId, content, model, extraCookies);
     console.log(`[Req ${completionId}] upstream status=${upstream.statusCode}`);
+
+    if (upstream.statusCode === 405 || upstream.statusCode >= 400) {
+      const body = await collectRawBody(upstream);
+      console.log(`[Req ${completionId}] upstream error body (first 200): ${body.slice(0, 200)}`);
+      convMgr.release(convId);
+      sendJson(res, 502, { error: { message: `Upstream returned ${upstream.statusCode}`, type: "upstream_error" } });
+      return;
+    }
 
     if (stream && !hasTools) {
       res.writeHead(200, {
@@ -465,18 +488,21 @@ async function handleCompletions(reqBody, authToken, extraCookies, res) {
 
       const parser = new NoahSSEParser({
         onText: (text) => { if (!res.writableEnded) writeSse(res, openaiChunk(completionId, model, text, null)); },
-        onDone: () => { pool.release(session); finishStream(res, completionId, model); },
-        onError: (err) => { pool.release(session); if (!res.writableEnded) { writeSse(res, { error: { message: err.message } }); res.write("data: [DONE]\n\n"); res.end(); } },
+        onDone: () => { convMgr.updateSentCount(convId, newSentCount); convMgr.release(convId); finishStream(res, completionId, model); },
+        onError: (err) => { convMgr.release(convId); if (!res.writableEnded) { writeSse(res, { error: { message: err.message } }); res.write("data: [DONE]\n\n"); res.end(); } },
       });
 
       upstream.on("data", (chunk) => parser.feed(chunk.toString("utf-8")));
-      upstream.on("end", () => { parser.flush(); if (!parser.done) { pool.release(session); finishStream(res, completionId, model); } });
-      upstream.on("error", (err) => { pool.release(session); if (!res.writableEnded) { writeSse(res, { error: { message: err.message } }); res.end(); } });
+      upstream.on("end", () => { parser.flush(); if (!parser.done) { convMgr.updateSentCount(convId, newSentCount); convMgr.release(convId); finishStream(res, completionId, model); } });
+      upstream.on("error", (err) => { convMgr.release(convId); if (!res.writableEnded) { writeSse(res, { error: { message: err.message } }); res.end(); } });
 
     } else {
       const fullText = await collectResponse(upstream);
-      pool.release(session);
       console.log(`[Req ${completionId}] collected ${fullText.length} chars: ${fullText.slice(0, 200)}${fullText.length > 200 ? '...' : ''}`);
+
+      // Update sent count on success
+      convMgr.updateSentCount(convId, newSentCount);
+      convMgr.release(convId);
 
       let toolCalls = [];
       let responseContent = fullText;
@@ -495,7 +521,6 @@ async function handleCompletions(reqBody, authToken, extraCookies, res) {
           for (const chunk of openaiToolCallChunks(completionId, model, toolCalls)) writeSse(res, chunk);
           writeSse(res, { id: `chatcmpl-${completionId}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
         } else {
-          console.log(`[Req ${completionId}] streaming text response (${(responseContent || '').length} chars) to client`);
           if (responseContent) writeSse(res, openaiChunk(completionId, model, responseContent, null));
           writeSse(res, openaiChunk(completionId, model, null, "stop"));
         }
@@ -505,7 +530,8 @@ async function handleCompletions(reqBody, authToken, extraCookies, res) {
       }
     }
   } catch (err) {
-    pool.release(session);
+    convMgr.release(convId);
+    console.error(`[Req ${completionId}] error: ${err.message}`);
     if (!res.headersSent) sendJson(res, 500, { error: { message: err.message, type: "server_error" } });
     else if (!res.writableEnded) { res.write(`data: ${JSON.stringify({ error: { message: err.message } })}\n\n`); res.end(); }
   }
@@ -516,7 +542,16 @@ function collectResponse(upstream) {
     let full = "";
     let resolved = false;
     let rawChunks = [];
-    const done = (src) => { if (!resolved) { resolved = true; console.log(`[collectResponse] resolved via ${src}, length=${full.length}`); if (full.length === 0 && rawChunks.length > 0) { console.log(`[collectResponse] RAW upstream (first 500): ${rawChunks.join('').slice(0, 500)}`); } resolve(full); } };
+    const done = (src) => {
+      if (!resolved) {
+        resolved = true;
+        console.log(`[collectResponse] resolved via ${src}, length=${full.length}`);
+        if (full.length === 0 && rawChunks.length > 0) {
+          console.log(`[collectResponse] RAW upstream (first 500): ${rawChunks.join('').slice(0, 500)}`);
+        }
+        resolve(full);
+      }
+    };
     const parser = new NoahSSEParser({
       onText: (text) => { full += text; },
       onDone: () => { done("sse-done"); },
@@ -525,7 +560,6 @@ function collectResponse(upstream) {
     upstream.on("data", (chunk) => { const s = chunk.toString("utf-8"); rawChunks.push(s); parser.feed(s); });
     upstream.on("end", () => {
       parser.flush();
-      // Detect upstream JSON error responses (HTTP 200 but body is {"code":401,...})
       if (full.length === 0 && rawChunks.length > 0) {
         const raw = rawChunks.join('');
         try {
@@ -538,6 +572,15 @@ function collectResponse(upstream) {
       done("stream-end");
     });
     upstream.on("error", (err) => { if (!resolved) { resolved = true; reject(err); } });
+  });
+}
+
+function collectRawBody(stream) {
+  return new Promise((resolve) => {
+    let data = "";
+    stream.on("data", (c) => (data += c.toString("utf-8")));
+    stream.on("end", () => resolve(data));
+    stream.on("error", () => resolve(data));
   });
 }
 
@@ -581,14 +624,11 @@ const server = http.createServer(async (req, res) => {
     console.log(`[${reqTime}] → POST /v1/chat/completions model=${params.model || DEFAULT_MODEL} stream=${!!params.stream} msgs=${msgCount} tools=${toolCount}`);
     console.log(`[${reqTime}]   last: ${preview}`);
 
-    // Always use server-side NOAH_AUTH_TOKEN for upstream calls.
-    // Client's Authorization header is ignored — it's for proxy access only.
+    // Always use server-side token
     const authToken = process.env.NOAH_AUTH_TOKEN || "";
     if (!authToken) { console.log(`[${reqTime}] ← 401 No token`); sendJson(res, 401, { error: { message: "Missing NOAH_AUTH_TOKEN env var", type: "authentication_error" } }); return; }
 
     const extraCookies = req.headers["x-extra-cookies"] || params.extra_cookies || process.env.NOAH_EXTRA_COOKIES || "";
-
-    if (!pool.initialized) { console.log(`[${reqTime}] ← 503 Pool not ready`); sendJson(res, 503, { error: { message: "Session pool not ready", type: "server_error" } }); return; }
 
     try { await handleCompletions(params, authToken, extraCookies, res); console.log(`[${reqTime}] ← 200 OK`); }
     catch (err) {
@@ -613,7 +653,7 @@ const server = http.createServer(async (req, res) => {
     });
 
   } else if (url === "/health" || url === "/pool") {
-    sendJson(res, 200, { status: "ok", version: "3.0.0", upstream: NOAH_BASE, pool: pool.stats() });
+    sendJson(res, 200, { status: "ok", version: "4.0.0", upstream: NOAH_BASE, conversations: convMgr.stats() });
 
   } else {
     sendJson(res, 404, { error: { message: "Not found", type: "invalid_request_error" } });
@@ -624,26 +664,18 @@ const server = http.createServer(async (req, res) => {
 
 async function main() {
   const authToken = process.env.NOAH_AUTH_TOKEN;
-  const extraCookies = process.env.NOAH_EXTRA_COOKIES || "";
-
   if (!authToken) {
     console.error("[Fatal] NOAH_AUTH_TOKEN environment variable is required");
     process.exit(1);
   }
 
-  try {
-    await pool.init(authToken, extraCookies, DEFAULT_GPTS_ID);
-  } catch (err) {
-    console.error(`[Fatal] Pool init failed: ${err.message}`);
-    process.exit(1);
-  }
-
   server.listen(PORT, HOST, () => {
-    console.log(`\nnoah-ai-proxy v3.0 — Single Pool (gptsId=${DEFAULT_GPTS_ID})`);
+    console.log(`\nnoah-ai-proxy v4.0 — Incremental Session Affinity`);
     console.log(`Listening: http://${HOST}:${PORT}`);
     console.log(`Upstream:  ${NOAH_BASE}`);
-    console.log(`Pool:      ${pool.sessions.length} sessions ready`);
+    console.log(`GptsId:    ${DEFAULT_GPTS_ID}`);
     console.log(`Default model: ${DEFAULT_MODEL}`);
+    console.log(`Conversations: ${convMgr.conversations.size} cached`);
     console.log(`\nEndpoints:`);
     console.log(`  POST /v1/chat/completions`);
     console.log(`  GET  /v1/models`);
