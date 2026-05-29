@@ -17,7 +17,8 @@ const PORT = parseInt(process.env.PORT || "4000", 10);
 const HOST = process.env.HOST || "127.0.0.1";
 const NOAH_BASE = process.env.NOAH_BASE || "https://ai.noahgroup.com";
 const DEFAULT_MODEL = "gpt-5.5";
-const DEFAULT_GPTS_ID = parseInt(process.env.GPTS_ID || "76", 10);
+const DEFAULT_GPTS_ID = parseInt(process.env.GPTS_ID || "87", 10);
+const DEFAULT_SKILL_NAME = process.env.SKILL_NAME || "tool-skills-creator";
 const POOL_SIZE = parseInt(process.env.POOL_SIZE || "10", 10);
 
 // ─── Utility ────────────────────────────────────────────────────────────────
@@ -191,10 +192,15 @@ class SessionPool {
 
   async _createSession(authToken, extraCookies, gptsId, index) {
     const headers = buildHeaders(authToken, extraCookies);
+    const body = { gptsId, sessionName: `proxy-pool-${index}` };
+    // gptsId 87 = Claude SDK with workspace (supports tool call + file generation)
+    if (gptsId === 87) {
+      body.skillName = DEFAULT_SKILL_NAME;
+    }
     const res = await httpsReq(
       `${NOAH_BASE}/api/noah-chat-svc/session/createSession`,
       { method: "POST", headers },
-      { gptsId, sessionName: `proxy-pool-${index}` }
+      body
     );
     if (res.status === 200 && res.body?.code === 200 && res.body.data) {
       return res.body.data.sessionId || res.body.data.id || res.body.data;
