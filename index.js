@@ -18,7 +18,7 @@ const path = require("path");
 const PORT = parseInt(process.env.PORT || "4000", 10);
 const HOST = process.env.HOST || "127.0.0.1";
 const NOAH_BASE = process.env.NOAH_BASE || "https://ai.noahgroup.com";
-const DEFAULT_MODEL = "us.anthropic.claude-sonnet-4-6-20250514";
+const DEFAULT_MODEL = "gpt-5.5";
 const DEFAULT_GPTS_ID = parseInt(process.env.GPTS_ID || "76", 10);
 const POOL_SIZE = parseInt(process.env.POOL_SIZE || "10", 10);
 
@@ -559,13 +559,11 @@ const server = http.createServer(async (req, res) => {
     sendJson(res, 200, {
       object: "list",
       data: [
-        { id: "us.anthropic.claude-sonnet-4-6-20250514", object: "model", created: 1700000000, owned_by: "noah-ai" },
-        { id: "us.anthropic.claude-opus-4-7", object: "model", created: 1700000000, owned_by: "noah-ai" },
         { id: "gpt-5.5", object: "model", created: 1700000000, owned_by: "noah-ai" },
         { id: "gpt-5.5-thinking", object: "model", created: 1700000000, owned_by: "noah-ai" },
-        { id: "gpt-4o", object: "model", created: 1700000000, owned_by: "noah-ai" },
-        { id: "gpt-4o-mini", object: "model", created: 1700000000, owned_by: "noah-ai" },
         { id: "deepseek-r1", object: "model", created: 1700000000, owned_by: "noah-ai" },
+        { id: "us.anthropic.claude-sonnet-4-6-20250514", object: "model", created: 1700000000, owned_by: "noah-ai" },
+        { id: "us.anthropic.claude-opus-4-7", object: "model", created: 1700000000, owned_by: "noah-ai" },
       ],
     });
 
