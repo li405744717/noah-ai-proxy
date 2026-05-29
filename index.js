@@ -468,11 +468,13 @@ async function handleCompletions(reqBody, authToken, extraCookies, res) {
     } else {
       const fullText = await collectResponse(upstream);
       pool.release(session);
+      console.log(`[Req ${completionId}] collected ${fullText.length} chars: ${fullText.slice(0, 200)}${fullText.length > 200 ? '...' : ''}`);
 
       let toolCalls = [];
       let responseContent = fullText;
       if (hasTools) {
         toolCalls = parseToolCallsFromText(fullText);
+        console.log(`[Req ${completionId}] parsed ${toolCalls.length} tool_calls`);
         if (toolCalls.length > 0) responseContent = stripToolCalls(fullText) || null;
       }
 
@@ -481,9 +483,11 @@ async function handleCompletions(reqBody, authToken, extraCookies, res) {
         writeSse(res, { id: `chatcmpl-${completionId}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
 
         if (toolCalls.length > 0) {
+          console.log(`[Req ${completionId}] streaming ${toolCalls.length} tool_calls to client`);
           for (const chunk of openaiToolCallChunks(completionId, model, toolCalls)) writeSse(res, chunk);
           writeSse(res, { id: `chatcmpl-${completionId}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
         } else {
+          console.log(`[Req ${completionId}] streaming text response (${(responseContent || '').length} chars) to client`);
           if (responseContent) writeSse(res, openaiChunk(completionId, model, responseContent, null));
           writeSse(res, openaiChunk(completionId, model, null, "stop"));
         }
@@ -502,14 +506,16 @@ async function handleCompletions(reqBody, authToken, extraCookies, res) {
 function collectResponse(upstream) {
   return new Promise((resolve, reject) => {
     let full = "";
+    let resolved = false;
+    const done = (src) => { if (!resolved) { resolved = true; console.log(`[collectResponse] resolved via ${src}, length=${full.length}`); resolve(full); } };
     const parser = new NoahSSEParser({
       onText: (text) => { full += text; },
-      onDone: () => { resolve(full); },
-      onError: (err) => { reject(err); },
+      onDone: () => { done("sse-done"); },
+      onError: (err) => { if (!resolved) { resolved = true; reject(err); } },
     });
     upstream.on("data", (chunk) => parser.feed(chunk.toString("utf-8")));
-    upstream.on("end", () => { parser.flush(); resolve(full); });
-    upstream.on("error", reject);
+    upstream.on("end", () => { parser.flush(); done("stream-end"); });
+    upstream.on("error", (err) => { if (!resolved) { resolved = true; reject(err); } });
   });
 }
 
