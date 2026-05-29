@@ -560,9 +560,6 @@ const server = http.createServer(async (req, res) => {
       object: "list",
       data: [
         { id: "gpt-5.5", object: "model", created: 1700000000, owned_by: "noah-ai" },
-        { id: "gpt-5.5-thinking", object: "model", created: 1700000000, owned_by: "noah-ai" },
-        { id: "deepseek-r1", object: "model", created: 1700000000, owned_by: "noah-ai" },
-        { id: "us.anthropic.claude-sonnet-4-6-20250514", object: "model", created: 1700000000, owned_by: "noah-ai" },
         { id: "us.anthropic.claude-opus-4-7", object: "model", created: 1700000000, owned_by: "noah-ai" },
       ],
     });
