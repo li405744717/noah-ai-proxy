@@ -1,10 +1,12 @@
 /**
- * litellm-bridge v1.0 — Bedrock to OpenAI API format adapter
+ * litellm-bridge v1.1 — Bedrock to OpenAI API format adapter
  * Zero dependencies. Pass ABSK key as Bearer token.
- * Supports: streaming, tool calling, all Claude models.
+ * Supports: streaming, tool calling, all Claude models, HTTP proxy (https_proxy).
  */
 const http = require("http");
 const https = require("https");
+const net = require("net");
+const tls = require("tls");
 const crypto = require("crypto");
 
 const PORT = parseInt(process.env.PORT || "4100", 10);
@@ -23,6 +25,41 @@ const MODEL_MAP = {
   "claude-3.5-sonnet": "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
   "claude-3-haiku": "us.anthropic.claude-3-haiku-20240307-v1:0",
 };
+
+function getProxy() {
+  const p = process.env.https_proxy || process.env.HTTPS_PROXY || process.env.http_proxy || process.env.HTTP_PROXY || "";
+  if (!p) return null;
+  try {
+    const u = new URL(p.startsWith("http") ? p : "http://" + p);
+    return { host: u.hostname, port: parseInt(u.port) || 1080 };
+  } catch { return null; }
+}
+
+function connectViaProxy(proxy, targetHost, targetPort) {
+  return new Promise((resolve, reject) => {
+    const conn = net.connect(proxy.port, proxy.host, () => {
+      conn.write(`CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n\r\n`);
+    });
+    conn.once("error", reject);
+    let buf = "";
+    const onData = (chunk) => {
+      buf += chunk.toString();
+      if (buf.includes("\r\n\r\n")) {
+        conn.removeListener("data", onData);
+        const statusLine = buf.split("\r\n")[0];
+        const code = parseInt(statusLine.split(" ")[1]);
+        if (code === 200) {
+          const tlsSock = tls.connect({ socket: conn, servername: targetHost }, () => resolve(tlsSock));
+          tlsSock.once("error", reject);
+        } else {
+          reject(new Error("Proxy CONNECT failed: " + statusLine));
+        }
+      }
+    };
+    conn.on("data", onData);
+    setTimeout(() => reject(new Error("Proxy connect timeout")), 10000);
+  });
+}
 
 function resolveModel(m) {
   if (!m) return DEFAULT_MODEL;
@@ -75,7 +112,6 @@ function convertMessages(msgs) {
       out.push({ role: "user", content: [{ type: "tool_result", tool_use_id: msg.tool_call_id, content: msg.content || "" }] });
     }
   }
-  // Merge consecutive same-role
   const merged = [];
   for (const msg of out) {
     if (merged.length > 0 && merged[merged.length - 1].role === msg.role) {
@@ -94,15 +130,28 @@ function convertTools(tools) {
 }
 
 function callBedrock(modelId, body, apiKey, stream) {
-  return new Promise((resolve, reject) => {
+  return new Promise(async (resolve, reject) => {
     const ep = stream ? "invoke-with-response-stream" : "invoke";
     const hostname = "bedrock-runtime." + REGION + ".amazonaws.com";
     const p = "/model/" + modelId + "/" + ep;
     const payload = JSON.stringify(body);
-    const req = https.request({ hostname, port: 443, path: p, method: "POST", headers: { "Content-Type": "application/json", "Authorization": "Bearer " + apiKey, "Content-Length": Buffer.byteLength(payload) } }, resolve);
-    req.on("error", reject);
-    req.write(payload);
-    req.end();
+    const headers = { "Content-Type": "application/json", "Authorization": "Bearer " + apiKey, "Content-Length": Buffer.byteLength(payload) };
+
+    const proxy = getProxy();
+    if (proxy) {
+      try {
+        const tlsSock = await connectViaProxy(proxy, hostname, 443);
+        const req = https.request({ socket: tlsSock, hostname, port: 443, path: p, method: "POST", headers, createConnection: () => tlsSock }, resolve);
+        req.on("error", reject);
+        req.write(payload);
+        req.end();
+      } catch (e) { reject(e); }
+    } else {
+      const req = https.request({ hostname, port: 443, path: p, method: "POST", headers }, resolve);
+      req.on("error", reject);
+      req.write(payload);
+      req.end();
+    }
   });
 }
 
@@ -183,7 +232,8 @@ async function handle(params, apiKey, res) {
   if (params.temperature != null) body.temperature = params.temperature;
   if (params.top_p != null) body.top_p = params.top_p;
   if (params.stop) body.stop_sequences = Array.isArray(params.stop) ? params.stop : [params.stop];
-  console.log("[" + cid + "] model=" + mid + " stream=" + stream + " msgs=" + messages.length + " tools=" + (tools?.length||0));
+  const proxy = getProxy();
+  console.log("[" + cid + "] model=" + mid + " stream=" + stream + " msgs=" + messages.length + " tools=" + (tools?.length||0) + (proxy ? " proxy=" + proxy.host + ":" + proxy.port : " direct"));
   try {
     const up = await callBedrock(mid, body, apiKey, stream);
     if (up.statusCode >= 400) {
@@ -216,10 +266,13 @@ http.createServer(async (req, res) => {
   } else if (url === "/v1/models") {
     json(res, 200, { object: "list", data: Object.entries(MODEL_MAP).map(([id, bid]) => ({ id, object: "model", created: 1700000000, owned_by: "anthropic" })) });
   } else if (url === "/health") {
-    json(res, 200, { status: "ok", version: "1.0.0", region: REGION, default_model: DEFAULT_MODEL });
+    const proxy = getProxy();
+    json(res, 200, { status: "ok", version: "1.1.0", region: REGION, default_model: DEFAULT_MODEL, proxy: proxy ? proxy.host + ":" + proxy.port : "none" });
   } else { json(res, 404, { error: { message: "Not found" } }); }
 }).listen(PORT, HOST, () => {
-  console.log("[litellm-bridge] http://" + HOST + ":" + PORT);
+  const proxy = getProxy();
+  console.log("[litellm-bridge v1.1] http://" + HOST + ":" + PORT);
   console.log("[litellm-bridge] Region: " + REGION + " | Default: " + DEFAULT_MODEL);
+  console.log("[litellm-bridge] Proxy: " + (proxy ? proxy.host + ":" + proxy.port : "direct (no proxy)"));
   console.log("[litellm-bridge] Models: " + Object.keys(MODEL_MAP).join(", "));
 });
