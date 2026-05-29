@@ -1,11 +1,11 @@
 /**
- * noah-ai-proxy v4.0 — OpenAI-compatible bridge via ai.noahgroup.com
+ * noah-ai-proxy v4.1 — OpenAI-compatible bridge via ai.noahgroup.com
  *
- * v4 Architecture: Incremental messaging with session affinity
- * - Each agent conversation maps to a dedicated Noah session
- * - Only NEW messages are sent each turn (Noah session retains context)
- * - Tool schema injected once on first turn, not repeated
- * - Reset detection: if conversation diverges, auto-create new session
+ * Architecture: Session pool + incremental messaging
+ * - Fixed session pool (gptsId=76), same as v3
+ * - Conversation→session affinity: same agent conversation reuses same session
+ * - Only NEW messages sent each turn (session retains context server-side)
+ * - Tool schema injected on first turn only
  */
 
 const http = require("http");
@@ -19,6 +19,7 @@ const HOST = process.env.HOST || "127.0.0.1";
 const NOAH_BASE = process.env.NOAH_BASE || "https://ai.noahgroup.com";
 const DEFAULT_MODEL = "gpt-5.5";
 const DEFAULT_GPTS_ID = parseInt(process.env.GPTS_ID || "76", 10);
+const POOL_SIZE = parseInt(process.env.POOL_SIZE || "10", 10);
 
 // ─── Utility ────────────────────────────────────────────────────────────────
 
@@ -58,144 +59,178 @@ function httpsReq(url, opts, body) {
   });
 }
 
-// ─── Conversation Session Manager ──────────────────────────────────────────
-// Maps agent conversations to Noah sessions, tracks message state
+// ─── Session Pool ───────────────────────────────────────────────────────────
 
-const CONV_FILE = path.join(__dirname, ".conversations.json");
+const POOL_FILE = path.join(__dirname, ".sessions.json");
 
-class ConversationManager {
-  constructor() {
-    // convId → { noahSessionId, sentCount, fingerprint, createdAt, lastUsed, busy }
-    this.conversations = new Map();
-    this.waitQueues = new Map(); // convId → [resolve callbacks]
-    this._load();
+class SessionPool {
+  constructor(size, prefix = "proxy-pool") {
+    this.size = size;
+    this.prefix = prefix;
+    this.sessions = [];       // [{id, busy, createdAt, useCount, convId, sentCount, fingerprint}]
+    this.waitQueue = [];
+    this.initialized = false;
   }
 
-  _load() {
-    try {
-      if (fs.existsSync(CONV_FILE)) {
-        const data = JSON.parse(fs.readFileSync(CONV_FILE, "utf-8"));
-        if (data.conversations) {
-          for (const [k, v] of Object.entries(data.conversations)) {
-            this.conversations.set(k, { ...v, busy: false });
-          }
-          console.log(`[ConvMgr] Loaded ${this.conversations.size} conversation mappings`);
+  async init(authToken, extraCookies, gptsId) {
+    const existing = await this._fetchExistingSessions(authToken, extraCookies, gptsId);
+    console.log(`[Pool] Found ${existing.length} existing proxy-pool sessions on server`);
+
+    for (const id of existing.slice(0, this.size)) {
+      this.sessions.push({ id, busy: false, createdAt: Date.now(), useCount: 0, convId: null, sentCount: 0, fingerprint: null });
+      console.log(`[Pool] Reusing session: ${id}`);
+    }
+
+    const needed = this.size - this.sessions.length;
+    if (needed > 0) {
+      console.log(`[Pool] Creating ${needed} new sessions...`);
+      const results = await Promise.allSettled(
+        Array.from({ length: needed }, (_, i) =>
+          this._createSession(authToken, extraCookies, gptsId, this.sessions.length + i)
+        )
+      );
+      for (const r of results) {
+        if (r.status === "fulfilled") {
+          this.sessions.push({ id: r.value, busy: false, createdAt: Date.now(), useCount: 0, convId: null, sentCount: 0, fingerprint: null });
+          console.log(`[Pool] Created: ${r.value}`);
+        } else {
+          console.error(`[Pool] Create failed: ${r.reason?.message}`);
         }
       }
-    } catch (err) {
-      console.warn(`[ConvMgr] Failed to load: ${err.message}`);
     }
+
+    this._saveToDisk();
+    this.initialized = true;
+    console.log(`[Pool] Ready: ${this.sessions.length}/${this.size} sessions`);
+    if (this.sessions.length === 0) throw new Error("Failed to create any sessions");
   }
 
-  _save() {
-    try {
-      const obj = {};
-      for (const [k, v] of this.conversations) {
-        obj[k] = { noahSessionId: v.noahSessionId, sentCount: v.sentCount, fingerprint: v.fingerprint, createdAt: v.createdAt, lastUsed: v.lastUsed };
+  // Acquire a session with conversation affinity
+  acquire(convId, fingerprint) {
+    // 1. Look for a session already bound to this conversation
+    const bound = this.sessions.find(s => !s.busy && s.convId === convId && s.fingerprint === fingerprint);
+    if (bound) {
+      bound.busy = true;
+      bound.useCount++;
+      return Promise.resolve(bound);
+    }
+
+    // 2. If conversation fingerprint changed (reset), find the old binding and clear it
+    const stale = this.sessions.find(s => !s.busy && s.convId === convId && s.fingerprint !== fingerprint);
+    if (stale) {
+      console.log(`[Pool] Conv ${convId.slice(0,8)} reset detected, clearing session ${stale.id}`);
+      stale.convId = convId;
+      stale.fingerprint = fingerprint;
+      stale.sentCount = 0;
+      stale.busy = true;
+      stale.useCount++;
+      return Promise.resolve(stale);
+    }
+
+    // 3. Find any free unbound session
+    const free = this.sessions.find(s => !s.busy && s.convId === null);
+    if (free) {
+      free.convId = convId;
+      free.fingerprint = fingerprint;
+      free.busy = true;
+      free.useCount++;
+      return Promise.resolve(free);
+    }
+
+    // 4. Steal the least-recently-used free session (bound to a different conversation)
+    const lru = this.sessions
+      .filter(s => !s.busy)
+      .sort((a, b) => (a.useCount - b.useCount))[0];
+    if (lru) {
+      console.log(`[Pool] Stealing session ${lru.id} from conv ${(lru.convId || '').slice(0,8)} for conv ${convId.slice(0,8)}`);
+      lru.convId = convId;
+      lru.fingerprint = fingerprint;
+      lru.sentCount = 0; // Reset: new conversation on this session means context mismatch
+      lru.busy = true;
+      lru.useCount++;
+      return Promise.resolve(lru);
+    }
+
+    // 5. All busy — queue
+    return new Promise((resolve) => {
+      this.waitQueue.push({ resolve, convId, fingerprint });
+    });
+  }
+
+  release(session) {
+    session.busy = false;
+    if (this.waitQueue.length > 0) {
+      const { resolve, convId, fingerprint } = this.waitQueue.shift();
+      // Re-bind if needed
+      if (session.convId !== convId) {
+        session.convId = convId;
+        session.fingerprint = fingerprint;
+        session.sentCount = 0;
       }
-      fs.writeFileSync(CONV_FILE, JSON.stringify({ conversations: obj, updatedAt: new Date().toISOString() }, null, 2), "utf-8");
-    } catch {}
-  }
-
-  getConversationId(messages) {
-    // Use system message + first user message as conversation identity
-    const systemMsg = messages.find(m => m.role === "system");
-    const firstUser = messages.find(m => m.role === "user");
-    const key = (systemMsg ? extractText(systemMsg) : "") + "||" + (firstUser ? extractText(firstUser).slice(0, 100) : "");
-    return md5(key);
-  }
-
-  getFingerprint(messages) {
-    // Fingerprint = hash of first 3 messages to detect conversation reset
-    const first3 = messages.slice(0, 3).map(m => `${m.role}:${extractText(m).slice(0, 50)}`).join("|");
-    return md5(first3);
-  }
-
-  async acquire(convId, messages, authToken, extraCookies) {
-    const existing = this.conversations.get(convId);
-    const fingerprint = this.getFingerprint(messages);
-
-    if (existing && existing.fingerprint === fingerprint && !existing.busy) {
-      existing.busy = true;
-      existing.lastUsed = Date.now();
-      return existing;
+      session.busy = true;
+      session.useCount++;
+      resolve(session);
     }
-
-    if (existing && existing.fingerprint === fingerprint && existing.busy) {
-      // Same conversation, but busy — wait
-      return new Promise((resolve) => {
-        if (!this.waitQueues.has(convId)) this.waitQueues.set(convId, []);
-        this.waitQueues.get(convId).push(resolve);
-      });
-    }
-
-    // New conversation or fingerprint changed (conversation reset)
-    if (existing && existing.fingerprint !== fingerprint) {
-      console.log(`[ConvMgr] Conversation ${convId.slice(0,8)} reset detected, creating new session`);
-    }
-
-    // Create new Noah session for this conversation
-    const noahSessionId = await this._createSession(authToken, extraCookies, convId);
-    const conv = {
-      noahSessionId,
-      sentCount: 0,
-      fingerprint,
-      createdAt: Date.now(),
-      lastUsed: Date.now(),
-      busy: true,
-    };
-    this.conversations.set(convId, conv);
-    this._save();
-    return conv;
-  }
-
-  release(convId) {
-    const conv = this.conversations.get(convId);
-    if (!conv) return;
-    conv.busy = false;
-    this._save();
-
-    // Wake up waiting requests for this conversation
-    const queue = this.waitQueues.get(convId);
-    if (queue && queue.length > 0) {
-      const next = queue.shift();
-      conv.busy = true;
-      next(conv);
-    }
-  }
-
-  updateSentCount(convId, count) {
-    const conv = this.conversations.get(convId);
-    if (conv) {
-      conv.sentCount = count;
-      this._save();
-    }
-  }
-
-  async _createSession(authToken, extraCookies, convId) {
-    const headers = buildHeaders(authToken, extraCookies);
-    const body = { gptsId: DEFAULT_GPTS_ID, sessionName: `conv-${convId.slice(0, 8)}` };
-    const res = await httpsReq(
-      `${NOAH_BASE}/api/noah-chat-svc/session/createSession`,
-      { method: "POST", headers },
-      body
-    );
-    if (res.status === 200 && res.body?.code === 200 && res.body.data) {
-      const id = res.body.data.sessionId || res.body.data.id || res.body.data;
-      console.log(`[ConvMgr] Created session ${id} for conv ${convId.slice(0,8)}`);
-      return id;
-    }
-    throw new Error(`createSession failed: ${JSON.stringify(res.body).slice(0, 200)}`);
   }
 
   stats() {
-    let busy = 0;
-    for (const v of this.conversations.values()) { if (v.busy) busy++; }
-    return { total: this.conversations.size, busy, free: this.conversations.size - busy };
+    const busy = this.sessions.filter(s => s.busy).length;
+    return { total: this.sessions.length, busy, free: this.sessions.length - busy, waiting: this.waitQueue.length };
+  }
+
+  async _fetchExistingSessions(authToken, extraCookies, gptsId) {
+    try {
+      const headers = buildHeaders(authToken, extraCookies);
+      const res = await httpsReq(
+        `${NOAH_BASE}/api/noah-chat-svc/session/listSessionRecord?pageNo=1&pageSize=50`,
+        { method: "GET", headers }, null
+      );
+      if (res.status === 200 && res.body?.code === 200 && Array.isArray(res.body.data)) {
+        return res.body.data
+          .filter(r => r.name && r.name.startsWith(`${this.prefix}-`) && r.gptsId === gptsId)
+          .map(r => r.id).filter(Boolean);
+      }
+      return this._loadFromDisk();
+    } catch (err) {
+      console.warn(`[Pool] Fetch failed: ${err.message}`);
+      return this._loadFromDisk();
+    }
+  }
+
+  _loadFromDisk() {
+    try {
+      if (fs.existsSync(POOL_FILE)) {
+        const data = JSON.parse(fs.readFileSync(POOL_FILE, "utf-8"));
+        if (Array.isArray(data.sessionIds)) return data.sessionIds;
+      }
+    } catch {}
+    return [];
+  }
+
+  _saveToDisk() {
+    try {
+      fs.writeFileSync(POOL_FILE, JSON.stringify({
+        sessionIds: this.sessions.map(s => s.id),
+        updatedAt: new Date().toISOString()
+      }, null, 2), "utf-8");
+    } catch {}
+  }
+
+  async _createSession(authToken, extraCookies, gptsId, index) {
+    const headers = buildHeaders(authToken, extraCookies);
+    const body = { gptsId, sessionName: `${this.prefix}-${index}` };
+    const res = await httpsReq(
+      `${NOAH_BASE}/api/noah-chat-svc/session/createSession`,
+      { method: "POST", headers }, body
+    );
+    if (res.status === 200 && res.body?.code === 200 && res.body.data) {
+      return res.body.data.sessionId || res.body.data.id || res.body.data;
+    }
+    throw new Error(`createSession failed: ${JSON.stringify(res.body).slice(0, 200)}`);
   }
 }
 
-const convMgr = new ConversationManager();
+const pool = new SessionPool(POOL_SIZE, "proxy-pool");
 
 // ─── Noah AI API ────────────────────────────────────────────────────────────
 
@@ -205,7 +240,7 @@ function buildHeaders(authToken, extraCookies) {
     Cookie: `NOAH_AI_AUTH_TOKEN=${authToken}${extraCookies ? "; " + extraCookies : ""}`,
     Origin: NOAH_BASE,
     Referer: `${NOAH_BASE}/home`,
-    "User-Agent": "Mozilla/5.0 (compatible; noah-ai-proxy/4.0)",
+    "User-Agent": "Mozilla/5.0 (compatible; noah-ai-proxy/4.1)",
     "request-id": uuid(),
   };
 }
@@ -279,15 +314,8 @@ class NoahSSEParser {
 
 function openaiChunk(id, model, content, finishReason) {
   return {
-    id: `chatcmpl-${id}`,
-    object: "chat.completion.chunk",
-    created: Math.floor(Date.now() / 1000),
-    model,
-    choices: [{
-      index: 0,
-      delta: content !== null ? { content } : {},
-      finish_reason: finishReason || null,
-    }],
+    id: `chatcmpl-${id}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model,
+    choices: [{ index: 0, delta: content !== null ? { content } : {}, finish_reason: finishReason || null }],
   };
 }
 
@@ -379,28 +407,36 @@ function stripToolCalls(text) {
   return text.replace(/<tool_call>\s*[\s\S]*?\s*<\/tool_call>/g, "").trim();
 }
 
-// ─── Incremental Message Formatting ────────────────────────────────────────
+// ─── Message Formatting (Incremental) ──────────────────────────────────────
 
 function extractText(msg) {
   if (typeof msg.content === "string") return msg.content;
-  if (Array.isArray(msg.content)) return msg.content.filter((p) => p.type === "text").map((p) => p.text).join("\n");
+  if (Array.isArray(msg.content)) return msg.content.filter(p => p.type === "text").map(p => p.text).join("\n");
   return String(msg.content || "");
 }
 
+function getConversationId(messages) {
+  const systemMsg = messages.find(m => m.role === "system");
+  const firstUser = messages.find(m => m.role === "user");
+  const key = (systemMsg ? extractText(systemMsg).slice(0, 200) : "") + "||" + (firstUser ? extractText(firstUser).slice(0, 100) : "");
+  return md5(key);
+}
+
+function getFingerprint(messages) {
+  const first3 = messages.slice(0, 3).map(m => `${m.role}:${extractText(m).slice(0, 50)}`).join("|");
+  return md5(first3);
+}
+
 function formatIncrementalMessages(messages, tools, sentCount) {
-  // First turn: send tool schema + all messages
-  // Subsequent turns: only send new messages since last sentCount
   const isFirstTurn = sentCount === 0;
   const newMessages = messages.slice(sentCount);
 
-  if (newMessages.length === 0) {
-    return { content: null, newSentCount: sentCount };
-  }
+  if (newMessages.length === 0) return null;
 
   const parts = [];
   const hasTools = tools && tools.length > 0;
 
-  // Only inject tool schema on first turn
+  // Tool schema only on first turn
   if (isFirstTurn && hasTools) {
     parts.push(buildToolSystemPrompt(tools));
   }
@@ -408,7 +444,6 @@ function formatIncrementalMessages(messages, tools, sentCount) {
   for (const msg of newMessages) {
     if (msg.role === "system") {
       if (isFirstTurn) parts.push(`[System]\n${extractText(msg)}`);
-      // Skip system messages on subsequent turns (already in session context)
     } else if (msg.role === "user") {
       parts.push(`[User]\n${extractText(msg)}`);
     } else if (msg.role === "assistant") {
@@ -423,20 +458,18 @@ function formatIncrementalMessages(messages, tools, sentCount) {
     }
   }
 
-  // Add reminder based on context
   if (hasTools) {
     const lastMsg = messages[messages.length - 1];
     if (lastMsg && lastMsg.role === "tool") {
-      parts.push(`[Reminder] The tool has finished executing. Based on the result above, decide your next step:
-- If more actions are needed to fulfill the user's original request, output additional <tool_call> blocks.
-- If the task is complete, provide a brief text summary of what was accomplished.
-Do NOT execute actions yourself. Only use <tool_call> blocks for actions.`);
+      parts.push(`[Reminder] The tool has finished. Based on the result, either output more <tool_call> blocks if needed, or provide a brief text summary if the task is complete. Do NOT execute actions yourself.`);
+    } else if (!isFirstTurn) {
+      parts.push(`[Reminder] Respond ONLY with <tool_call> blocks. Do NOT execute actions yourself.`);
     } else {
-      parts.push(`[Reminder] Respond ONLY with <tool_call> blocks matching the available functions. Do NOT execute actions yourself. Output nothing else unless no function matches.`);
+      parts.push(`[Reminder] You MUST NOT execute the task yourself. Analyze the user's intent and respond ONLY with <tool_call> blocks matching the available functions above. Output nothing else.`);
     }
   }
 
-  return { content: parts.join("\n\n"), newSentCount: messages.length };
+  return parts.join("\n\n");
 }
 
 // ─── Request Handler ────────────────────────────────────────────────────────
@@ -449,33 +482,33 @@ async function handleCompletions(reqBody, authToken, extraCookies, res) {
   const hasTools = tools.length > 0;
 
   const completionId = shortId();
-  const convId = convMgr.getConversationId(messages);
+  const convId = getConversationId(messages);
+  const fingerprint = getFingerprint(messages);
 
-  // Acquire conversation session
-  const conv = await convMgr.acquire(convId, messages, authToken, extraCookies);
-  console.log(`[Req ${completionId}] conv=${convId.slice(0,8)} session=${conv.noahSessionId} sentCount=${conv.sentCount}→${messages.length} model=${model} hasTools=${hasTools}`);
+  // Acquire session with affinity
+  const session = await pool.acquire(convId, fingerprint);
+  const sentCount = session.sentCount;
 
-  // Format only incremental messages
-  const { content, newSentCount } = formatIncrementalMessages(messages, tools, conv.sentCount);
-
+  // Format incremental content
+  const content = formatIncrementalMessages(messages, tools, sentCount);
   if (!content) {
-    convMgr.release(convId);
+    pool.release(session);
     sendJson(res, 400, { error: { message: "No new message content", type: "invalid_request_error" } });
     return;
   }
 
-  const contentSize = Buffer.byteLength(content, 'utf-8');
-  console.log(`[Req ${completionId}] sending ${contentSize} bytes (incremental: msgs ${conv.sentCount}→${newSentCount})`);
+  const contentBytes = Buffer.byteLength(content, 'utf-8');
+  console.log(`[Req ${completionId}] conv=${convId.slice(0,8)} session=${session.id} sent=${sentCount}→${messages.length} size=${contentBytes}B model=${model} tools=${tools.length}`);
 
   try {
-    const upstream = await callStreamChat(authToken, conv.noahSessionId, content, model, extraCookies);
+    const upstream = await callStreamChat(authToken, session.id, content, model, extraCookies);
     console.log(`[Req ${completionId}] upstream status=${upstream.statusCode}`);
 
-    if (upstream.statusCode === 405 || upstream.statusCode >= 400) {
-      const body = await collectRawBody(upstream);
-      console.log(`[Req ${completionId}] upstream error body (first 200): ${body.slice(0, 200)}`);
-      convMgr.release(convId);
-      sendJson(res, 502, { error: { message: `Upstream returned ${upstream.statusCode}`, type: "upstream_error" } });
+    if (upstream.statusCode >= 400) {
+      const errBody = await collectRawBody(upstream);
+      console.log(`[Req ${completionId}] upstream error (first 200): ${errBody.slice(0, 200)}`);
+      pool.release(session);
+      sendJson(res, 502, { error: { message: `Upstream ${upstream.statusCode}`, type: "upstream_error" } });
       return;
     }
 
@@ -488,21 +521,20 @@ async function handleCompletions(reqBody, authToken, extraCookies, res) {
 
       const parser = new NoahSSEParser({
         onText: (text) => { if (!res.writableEnded) writeSse(res, openaiChunk(completionId, model, text, null)); },
-        onDone: () => { convMgr.updateSentCount(convId, newSentCount); convMgr.release(convId); finishStream(res, completionId, model); },
-        onError: (err) => { convMgr.release(convId); if (!res.writableEnded) { writeSse(res, { error: { message: err.message } }); res.write("data: [DONE]\n\n"); res.end(); } },
+        onDone: () => { session.sentCount = messages.length; pool.release(session); finishStream(res, completionId, model); },
+        onError: (err) => { pool.release(session); if (!res.writableEnded) { writeSse(res, { error: { message: err.message } }); res.write("data: [DONE]\n\n"); res.end(); } },
       });
 
       upstream.on("data", (chunk) => parser.feed(chunk.toString("utf-8")));
-      upstream.on("end", () => { parser.flush(); if (!parser.done) { convMgr.updateSentCount(convId, newSentCount); convMgr.release(convId); finishStream(res, completionId, model); } });
-      upstream.on("error", (err) => { convMgr.release(convId); if (!res.writableEnded) { writeSse(res, { error: { message: err.message } }); res.end(); } });
+      upstream.on("end", () => { parser.flush(); if (!parser.done) { session.sentCount = messages.length; pool.release(session); finishStream(res, completionId, model); } });
+      upstream.on("error", (err) => { pool.release(session); if (!res.writableEnded) { writeSse(res, { error: { message: err.message } }); res.end(); } });
 
     } else {
       const fullText = await collectResponse(upstream);
-      console.log(`[Req ${completionId}] collected ${fullText.length} chars: ${fullText.slice(0, 200)}${fullText.length > 200 ? '...' : ''}`);
+      session.sentCount = messages.length;
+      pool.release(session);
 
-      // Update sent count on success
-      convMgr.updateSentCount(convId, newSentCount);
-      convMgr.release(convId);
+      console.log(`[Req ${completionId}] collected ${fullText.length} chars: ${fullText.slice(0, 150)}${fullText.length > 150 ? '...' : ''}`);
 
       let toolCalls = [];
       let responseContent = fullText;
@@ -517,7 +549,6 @@ async function handleCompletions(reqBody, authToken, extraCookies, res) {
         writeSse(res, { id: `chatcmpl-${completionId}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
 
         if (toolCalls.length > 0) {
-          console.log(`[Req ${completionId}] streaming ${toolCalls.length} tool_calls to client`);
           for (const chunk of openaiToolCallChunks(completionId, model, toolCalls)) writeSse(res, chunk);
           writeSse(res, { id: `chatcmpl-${completionId}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
         } else {
@@ -530,7 +561,7 @@ async function handleCompletions(reqBody, authToken, extraCookies, res) {
       }
     }
   } catch (err) {
-    convMgr.release(convId);
+    pool.release(session);
     console.error(`[Req ${completionId}] error: ${err.message}`);
     if (!res.headersSent) sendJson(res, 500, { error: { message: err.message, type: "server_error" } });
     else if (!res.writableEnded) { res.write(`data: ${JSON.stringify({ error: { message: err.message } })}\n\n`); res.end(); }
@@ -545,9 +576,13 @@ function collectResponse(upstream) {
     const done = (src) => {
       if (!resolved) {
         resolved = true;
-        console.log(`[collectResponse] resolved via ${src}, length=${full.length}`);
         if (full.length === 0 && rawChunks.length > 0) {
-          console.log(`[collectResponse] RAW upstream (first 500): ${rawChunks.join('').slice(0, 500)}`);
+          const raw = rawChunks.join('');
+          console.log(`[collectResponse] empty response, RAW (first 300): ${raw.slice(0, 300)}`);
+          try {
+            const errBody = JSON.parse(raw);
+            if (errBody.code && errBody.code !== 200) { reject(new Error(`upstream: ${errBody.msg || raw.slice(0, 100)}`)); return; }
+          } catch {}
         }
         resolve(full);
       }
@@ -558,19 +593,7 @@ function collectResponse(upstream) {
       onError: (err) => { if (!resolved) { resolved = true; reject(err); } },
     });
     upstream.on("data", (chunk) => { const s = chunk.toString("utf-8"); rawChunks.push(s); parser.feed(s); });
-    upstream.on("end", () => {
-      parser.flush();
-      if (full.length === 0 && rawChunks.length > 0) {
-        const raw = rawChunks.join('');
-        try {
-          const errBody = JSON.parse(raw);
-          if (errBody.code && errBody.code !== 200) {
-            if (!resolved) { resolved = true; reject(new Error(`upstream error: ${errBody.msg || errBody.message || raw.slice(0, 200)}`)); return; }
-          }
-        } catch {}
-      }
-      done("stream-end");
-    });
+    upstream.on("end", () => { parser.flush(); done("stream-end"); });
     upstream.on("error", (err) => { if (!resolved) { resolved = true; reject(err); } });
   });
 }
@@ -614,7 +637,7 @@ const server = http.createServer(async (req, res) => {
 
     let params;
     try { params = JSON.parse(body); }
-    catch { console.log(`[${reqTime}] ← 400 Invalid JSON`); sendJson(res, 400, { error: { message: "Invalid JSON", type: "invalid_request_error" } }); return; }
+    catch { sendJson(res, 400, { error: { message: "Invalid JSON", type: "invalid_request_error" } }); return; }
 
     const msgCount = (params.messages || []).length;
     const toolCount = (params.tools || []).length;
@@ -624,15 +647,15 @@ const server = http.createServer(async (req, res) => {
     console.log(`[${reqTime}] → POST /v1/chat/completions model=${params.model || DEFAULT_MODEL} stream=${!!params.stream} msgs=${msgCount} tools=${toolCount}`);
     console.log(`[${reqTime}]   last: ${preview}`);
 
-    // Always use server-side token
     const authToken = process.env.NOAH_AUTH_TOKEN || "";
-    if (!authToken) { console.log(`[${reqTime}] ← 401 No token`); sendJson(res, 401, { error: { message: "Missing NOAH_AUTH_TOKEN env var", type: "authentication_error" } }); return; }
-
+    if (!authToken) { sendJson(res, 401, { error: { message: "Missing NOAH_AUTH_TOKEN", type: "authentication_error" } }); return; }
     const extraCookies = req.headers["x-extra-cookies"] || params.extra_cookies || process.env.NOAH_EXTRA_COOKIES || "";
+
+    if (!pool.initialized) { sendJson(res, 503, { error: { message: "Pool not ready", type: "server_error" } }); return; }
 
     try { await handleCompletions(params, authToken, extraCookies, res); console.log(`[${reqTime}] ← 200 OK`); }
     catch (err) {
-      console.error(`[${reqTime}] ← 500 Error: ${err.message}`);
+      console.error(`[${reqTime}] ← 500: ${err.message}`);
       if (!res.headersSent) sendJson(res, 500, { error: { message: err.message, type: "server_error" } });
     }
 
@@ -653,7 +676,7 @@ const server = http.createServer(async (req, res) => {
     });
 
   } else if (url === "/health" || url === "/pool") {
-    sendJson(res, 200, { status: "ok", version: "4.0.0", upstream: NOAH_BASE, conversations: convMgr.stats() });
+    sendJson(res, 200, { status: "ok", version: "4.1.0", upstream: NOAH_BASE, pool: pool.stats() });
 
   } else {
     sendJson(res, 404, { error: { message: "Not found", type: "invalid_request_error" } });
@@ -669,13 +692,21 @@ async function main() {
     process.exit(1);
   }
 
+  const extraCookies = process.env.NOAH_EXTRA_COOKIES || "";
+
+  try {
+    await pool.init(authToken, extraCookies, DEFAULT_GPTS_ID);
+  } catch (err) {
+    console.error(`[Fatal] Pool init failed: ${err.message}`);
+    process.exit(1);
+  }
+
   server.listen(PORT, HOST, () => {
-    console.log(`\nnoah-ai-proxy v4.0 — Incremental Session Affinity`);
+    console.log(`\nnoah-ai-proxy v4.1 — Pool + Incremental Messaging`);
     console.log(`Listening: http://${HOST}:${PORT}`);
     console.log(`Upstream:  ${NOAH_BASE}`);
-    console.log(`GptsId:    ${DEFAULT_GPTS_ID}`);
+    console.log(`Pool:      ${pool.sessions.length} sessions (gptsId=${DEFAULT_GPTS_ID})`);
     console.log(`Default model: ${DEFAULT_MODEL}`);
-    console.log(`Conversations: ${convMgr.conversations.size} cached`);
     console.log(`\nEndpoints:`);
     console.log(`  POST /v1/chat/completions`);
     console.log(`  GET  /v1/models`);
