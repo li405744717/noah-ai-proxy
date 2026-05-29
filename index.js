@@ -515,7 +515,20 @@ function collectResponse(upstream) {
       onError: (err) => { if (!resolved) { resolved = true; reject(err); } },
     });
     upstream.on("data", (chunk) => { const s = chunk.toString("utf-8"); rawChunks.push(s); parser.feed(s); });
-    upstream.on("end", () => { parser.flush(); done("stream-end"); });
+    upstream.on("end", () => {
+      parser.flush();
+      // Detect upstream JSON error responses (HTTP 200 but body is {"code":401,...})
+      if (full.length === 0 && rawChunks.length > 0) {
+        const raw = rawChunks.join('');
+        try {
+          const errBody = JSON.parse(raw);
+          if (errBody.code && errBody.code !== 200) {
+            if (!resolved) { resolved = true; reject(new Error(`upstream error: ${errBody.msg || errBody.message || raw.slice(0, 200)}`)); return; }
+          }
+        } catch {}
+      }
+      done("stream-end");
+    });
     upstream.on("error", (err) => { if (!resolved) { resolved = true; reject(err); } });
   });
 }
@@ -560,9 +573,10 @@ const server = http.createServer(async (req, res) => {
     console.log(`[${reqTime}] → POST /v1/chat/completions model=${params.model || DEFAULT_MODEL} stream=${!!params.stream} msgs=${msgCount} tools=${toolCount}`);
     console.log(`[${reqTime}]   last: ${preview}`);
 
-    const authHeader = req.headers["authorization"] || "";
-    const authToken = req.headers["x-auth-token"] || (authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "") || process.env.NOAH_AUTH_TOKEN || "";
-    if (!authToken) { console.log(`[${reqTime}] ← 401 No token`); sendJson(res, 401, { error: { message: "Missing auth token", type: "authentication_error" } }); return; }
+    // Always use server-side NOAH_AUTH_TOKEN for upstream calls.
+    // Client's Authorization header is ignored — it's for proxy access only.
+    const authToken = process.env.NOAH_AUTH_TOKEN || "";
+    if (!authToken) { console.log(`[${reqTime}] ← 401 No token`); sendJson(res, 401, { error: { message: "Missing NOAH_AUTH_TOKEN env var", type: "authentication_error" } }); return; }
 
     const extraCookies = req.headers["x-extra-cookies"] || params.extra_cookies || process.env.NOAH_EXTRA_COOKIES || "";
 
