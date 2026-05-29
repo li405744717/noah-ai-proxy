@@ -406,7 +406,11 @@ function stripToolCalls(text) {
 
 function formatMessages(messages, tools) {
   const parts = [];
-  if (tools && tools.length > 0) parts.push(buildToolSystemPrompt(tools));
+  const hasTools = tools && tools.length > 0;
+
+  if (hasTools) {
+    parts.push(buildToolSystemPrompt(tools));
+  }
 
   for (const msg of messages) {
     if (msg.role === "system") parts.push(`[System]\n${extractText(msg)}`);
@@ -422,6 +426,11 @@ function formatMessages(messages, tools) {
       parts.push(`[Tool Result (${msg.name || msg.tool_call_id || "?"})]\n${msg.content}`);
     }
   }
+
+  if (hasTools) {
+    parts.push(`[Reminder] You MUST NOT execute the task yourself. Do NOT create files, run code, or use workspace tools. Analyze the user's intent and respond ONLY with <tool_call> blocks matching the available functions above. Output nothing else.`);
+  }
+
   return parts.join("\n\n");
 }
 
