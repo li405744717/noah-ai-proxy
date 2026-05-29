@@ -353,32 +353,32 @@ function openaiResponse(id, model, content, toolCalls) {
 // ─── Tool Calling Support ───────────────────────────────────────────────────
 
 const TOOL_SYSTEM_PROMPT = `[CRITICAL INSTRUCTION]
-
-You are an API backend in STRICT function-calling mode. You MUST NOT execute any action yourself. You MUST NOT write files, run code, or describe steps. Your ONLY job: analyze the request and return structured tool_call commands.
-
-Output format (respond with ONLY this, nothing else):
-
+You are in STRICT function-calling mode. Do NOT execute actions. Return ONLY <tool_call> blocks.
+Format:
 <tool_call>
 {"name": "function_name", "arguments": {"param1": "value1"}}
 </tool_call>
-
-Rules:
-- Output ONLY <tool_call> blocks. No text, no explanations, no markdown.
-- Multiple calls = multiple <tool_call> blocks.
-- If NO function matches, respond in plain text.
-- NEVER execute the action. ONLY return the command.
-
+Rules: ONLY <tool_call> blocks. No text. Multiple calls = multiple blocks. If no function matches, reply in plain text.
 Available functions:
 `;
 
-function buildToolSystemPrompt(tools) {
+const MAX_CONTENT_BYTES = 15000; // WAF limit ~16KB, leave margin
+
+function buildToolSystemPrompt(tools, compact) {
   if (!tools || !tools.length) return "";
   let prompt = TOOL_SYSTEM_PROMPT;
   for (const tool of tools) {
     const fn = tool.function || tool;
-    prompt += `\n### ${fn.name}\n`;
-    if (fn.description) prompt += `${fn.description}\n`;
-    if (fn.parameters) prompt += `Parameters: ${JSON.stringify(fn.parameters)}\n`;
+    if (compact) {
+      // Ultra-compact: just name + param names
+      const paramNames = fn.parameters?.properties ? Object.keys(fn.parameters.properties).join(", ") : "";
+      const required = fn.parameters?.required ? ` (required: ${fn.parameters.required.join(", ")})` : "";
+      prompt += `- ${fn.name}(${paramNames})${required}\n`;
+    } else {
+      prompt += `\n### ${fn.name}\n`;
+      if (fn.description) prompt += `${fn.description}\n`;
+      if (fn.parameters) prompt += `Parameters: ${JSON.stringify(fn.parameters)}\n`;
+    }
   }
   return prompt;
 }
@@ -433,12 +433,37 @@ function formatIncrementalMessages(messages, tools, sentCount) {
 
   if (newMessages.length === 0) return null;
 
-  const parts = [];
   const hasTools = tools && tools.length > 0;
 
-  // Tool schema only on first turn
+  // Try normal format first, fall back to compact if too large
+  const content = _buildContent(newMessages, tools, hasTools, isFirstTurn, messages, false);
+  const size = Buffer.byteLength(content, 'utf-8');
+
+  if (size <= MAX_CONTENT_BYTES) return content;
+
+  // Too large — try compact tool schema
+  console.log(`[Format] Content too large (${size}B), trying compact mode...`);
+  const compact = _buildContent(newMessages, tools, hasTools, isFirstTurn, messages, true);
+  const compactSize = Buffer.byteLength(compact, 'utf-8');
+
+  if (compactSize <= MAX_CONTENT_BYTES) {
+    console.log(`[Format] Compact mode OK (${compactSize}B)`);
+    return compact;
+  }
+
+  // Still too large — truncate: keep only system + last 5 messages
+  console.log(`[Format] Still too large (${compactSize}B), truncating to last 5 messages...`);
+  const truncMessages = newMessages.slice(-5);
+  const truncated = _buildContent(truncMessages, tools, hasTools, isFirstTurn, messages, true);
+  console.log(`[Format] Truncated to ${Buffer.byteLength(truncated, 'utf-8')}B`);
+  return truncated;
+}
+
+function _buildContent(newMessages, tools, hasTools, isFirstTurn, allMessages, compact) {
+  const parts = [];
+
   if (isFirstTurn && hasTools) {
-    parts.push(buildToolSystemPrompt(tools));
+    parts.push(buildToolSystemPrompt(tools, compact));
   }
 
   for (const msg of newMessages) {
@@ -454,18 +479,19 @@ function formatIncrementalMessages(messages, tools, sentCount) {
         }
       }
     } else if (msg.role === "tool") {
-      parts.push(`[Tool Result (${msg.name || msg.tool_call_id || "?"})]\n${msg.content}`);
+      const content = msg.content || "";
+      // Truncate very long tool results
+      const truncContent = content.length > 500 ? content.slice(0, 500) + "...[truncated]" : content;
+      parts.push(`[Tool Result (${msg.name || msg.tool_call_id || "?"})]\n${truncContent}`);
     }
   }
 
   if (hasTools) {
-    const lastMsg = messages[messages.length - 1];
+    const lastMsg = allMessages[allMessages.length - 1];
     if (lastMsg && lastMsg.role === "tool") {
-      parts.push(`[Reminder] The tool has finished. Based on the result, either output more <tool_call> blocks if needed, or provide a brief text summary if the task is complete. Do NOT execute actions yourself.`);
-    } else if (!isFirstTurn) {
-      parts.push(`[Reminder] Respond ONLY with <tool_call> blocks. Do NOT execute actions yourself.`);
+      parts.push(`[Reminder] Tool finished. Output more <tool_call> if needed, or brief text summary if done.`);
     } else {
-      parts.push(`[Reminder] You MUST NOT execute the task yourself. Analyze the user's intent and respond ONLY with <tool_call> blocks matching the available functions above. Output nothing else.`);
+      parts.push(`[Reminder] Respond ONLY with <tool_call> blocks. Do NOT execute actions yourself.`);
     }
   }
 
