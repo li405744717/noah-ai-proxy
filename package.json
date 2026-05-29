@@ -1,14 +1,13 @@
 {
   "name": "noah-ai-proxy",
-  "version": "1.0.0",
-  "description": "OpenAI-compatible proxy that bridges to Agent Gateway sidecar via authorized session path",
+  "version": "2.0.0",
+  "description": "OpenAI-compatible bridge via ai.noahgroup.com approved API path",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "node index.js"
+    "start": "node index.js"
   },
-  "dependencies": {
-    "express": "^4.18.2",
-    "uuid": "^9.0.0"
-  }
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "license": "MIT"
 }

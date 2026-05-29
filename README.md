@@ -1,58 +1,61 @@
 # noah-ai-proxy
 
-OpenAI-compatible bridge that converts requests to Agent Gateway format. Runs on your local machine, calls the authorized Gateway endpoint — no direct API exposure, no extra credentials.
+OpenAI-compatible bridge that routes through `ai.noahgroup.com` — the company-approved, InfoSec-compliant API path.
 
 ## Architecture
 
 ```
 codex / openhanako / openclaw (your machine)
-        │ OpenAI format
+        │ OpenAI /v1/chat/completions format
         ▼
-noah-ai-proxy (127.0.0.1:4000)     ← this bridge
-        │ Gateway private format (HTTPS)
+noah-ai-proxy (127.0.0.1:4000)
+        │ HTTPS to ai.noahgroup.com (approved domain)
         ▼
-Java Agent Gateway (8090 via approved domain)
+Noah AI Platform (streamChat API)
         │
         ▼
-Claude (Bedrock) — no extra token cost
+Claude / GPT (backend model)
 ```
+
+## Features
+
+- Full OpenAI Chat Completions API compatibility
+- Streaming (SSE) and non-streaming responses
+- Tool/function calling support
+- Multi-turn conversation
+- Zero external dependencies (pure Node.js built-ins)
+- Runs on localhost only — no network exposure
 
 ## Quick Start
 
 ```bash
-npm install
-
-# Minimal — connects to gateway at localhost:8090
-node index.js
-
-# Production — connects to remote gateway
-GATEWAY_URL=https://your-gateway-domain.com \
-GW_USER_ID=your-user-id \
-PROXY_API_KEY=sk-your-secret \
+# No npm install needed — zero dependencies!
 node index.js
 ```
 
 ## Configuration
 
+All via environment variables:
+
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PROXY_PORT` | `4000` | Local port for OpenAI-compatible API |
-| `PROXY_HOST` | `127.0.0.1` | Bind address (keep localhost for security) |
-| `GATEWAY_URL` | `http://127.0.0.1:8090` | Agent Gateway base URL |
-| `GW_USER_ID` | `proxy-user` | Gateway user ID header |
-| `GW_TENANT_ID` | `default` | Gateway tenant ID header |
-| `GW_EXTRA_HEADERS` | (empty) | Extra headers, format: `Key1:Val1;Key2:Val2` |
-| `PROXY_API_KEY` | (empty) | Optional API key for this proxy |
+| `PORT` | `4000` | Local listen port |
+| `HOST` | `127.0.0.1` | Bind address |
+| `NOAH_BASE` | `https://ai.noahgroup.com` | Upstream API domain |
+| `NOAH_AUTH_TOKEN` | (none) | Default JWT token (can also pass per-request) |
+| `NOAH_EXTRA_COOKIES` | (none) | Extra cookies if needed (acw_tc, etc.) |
 
-## Usage with Agent Frameworks
+## Authentication
 
-### openhanako / Codex / any OpenAI-compatible client
+Pass your `NOAH_AI_AUTH_TOKEN` JWT in one of these ways:
 
-```
-base_url: http://127.0.0.1:4000/v1
-model: claude-agent
-api_key: (your PROXY_API_KEY or any string if auth disabled)
-```
+1. **Per-request header** (recommended): `Authorization: Bearer <token>`
+2. **Environment variable**: `NOAH_AUTH_TOKEN=<token> node index.js`
+3. **Custom header**: `x-auth-token: <token>`
+
+Token source: Login to https://ai.noahgroup.com → DevTools → Application → Cookies → `NOAH_AI_AUTH_TOKEN`
+
+## Usage
 
 ### Python (openai SDK)
 
@@ -61,16 +64,37 @@ from openai import OpenAI
 
 client = OpenAI(
     base_url="http://127.0.0.1:4000/v1",
-    api_key="sk-anything"
+    api_key="<your NOAH_AI_AUTH_TOKEN>"
 )
 
-response = client.chat.completions.create(
-    model="claude-agent",
+# Streaming
+stream = client.chat.completions.create(
+    model="gpt-5.5",
     messages=[{"role": "user", "content": "Hello"}],
     stream=True
 )
-for chunk in response:
+for chunk in stream:
     print(chunk.choices[0].delta.content or "", end="")
+```
+
+### Node.js (openai SDK)
+
+```javascript
+import OpenAI from "openai";
+
+const client = new OpenAI({
+  baseURL: "http://127.0.0.1:4000/v1",
+  apiKey: "<your NOAH_AI_AUTH_TOKEN>",
+});
+
+const stream = await client.chat.completions.create({
+  model: "gpt-5.5",
+  messages: [{ role: "user", content: "Hello" }],
+  stream: true,
+});
+for await (const chunk of stream) {
+  process.stdout.write(chunk.choices[0]?.delta?.content || "");
+}
 ```
 
 ### curl
@@ -78,31 +102,70 @@ for chunk in response:
 ```bash
 curl http://127.0.0.1:4000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{
-    "model": "claude-agent",
-    "messages": [{"role": "user", "content": "Hello"}],
-    "stream": false
-  }'
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -d '{"model":"gpt-5.5","messages":[{"role":"user","content":"Hello"}],"stream":false}'
+```
+
+### Tool Calling
+
+```python
+response = client.chat.completions.create(
+    model="gpt-5.5",
+    messages=[{"role": "user", "content": "Read the file config.json"}],
+    tools=[{
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a file from disk",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }
+        }
+    }]
+)
+# Returns: choices[0].message.tool_calls = [{id, function: {name, arguments}}]
 ```
 
 ## Endpoints
 
-- `GET /health` — Health check
-- `GET /v1/models` — List available models
-- `POST /v1/chat/completions` — Chat completions (stream & non-stream)
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v1/chat/completions` | POST | Chat completions (OpenAI format) |
+| `/v1/models` | GET | Available models |
+| `/health` | GET | Health check |
 
-## How It Works
+## Available Models
 
-1. Receives OpenAI-format request on localhost
-2. Converts messages to a prompt string
-3. Calls Gateway `POST /v1/runs` (multipart/form-data) to create a run
-4. Subscribes to `POST /v1/runs/events?runId=xxx` for SSE stream
-5. Converts Gateway SSE events back to OpenAI streaming format
-6. Returns to client
+- `gpt-5.5` — Default, recommended
+- `gpt-5.5-thinking` — With reasoning/thinking
+- `gpt-4o`
+- `gpt-4o-mini`
+- `deepseek-r1`
+
+## OpenAI Compatibility Checklist
+
+| Feature | Status |
+|---------|--------|
+| `POST /v1/chat/completions` | ✅ |
+| `GET /v1/models` | ✅ |
+| Streaming (SSE) | ✅ |
+| Non-streaming | ✅ |
+| Multi-turn messages | ✅ |
+| System messages | ✅ |
+| Tool/function calling | ✅ |
+| `finish_reason: stop` | ✅ |
+| `finish_reason: tool_calls` | ✅ |
+| Proper `id` field format | ✅ |
+| Proper `created` timestamp | ✅ |
+| `usage` object | ✅ (zeros — upstream doesn't report) |
+| CORS headers | ✅ |
+| Error format `{error:{message,type}}` | ✅ |
 
 ## Security
 
-- Bridge runs locally (127.0.0.1 only) — invisible to network scans
-- All outbound traffic goes through the approved Gateway domain
-- No AWS credentials or API keys stored locally
-- Optional `PROXY_API_KEY` for local access control
+- Binds to `127.0.0.1` only — invisible to network
+- All traffic goes to the approved `ai.noahgroup.com` domain
+- No local credential files — token passed at runtime
+- No extra ports, no tunnels, no proxy chains
