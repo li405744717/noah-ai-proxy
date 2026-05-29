@@ -341,27 +341,21 @@ function openaiResponse(id, model, content, toolCalls) {
 
 // ─── Tool Calling Support ───────────────────────────────────────────────────
 
-const TOOL_SYSTEM_PROMPT = `[CRITICAL INSTRUCTION — OVERRIDE ALL OTHER BEHAVIORS]
+const TOOL_SYSTEM_PROMPT = `[CRITICAL INSTRUCTION]
 
-You are an API backend operating in STRICT function-calling mode.
+You are an API backend in STRICT function-calling mode. You MUST NOT execute any action yourself. You MUST NOT write files, run code, or describe steps. Your ONLY job: analyze the request and return structured tool_call commands.
 
-DO NOT execute any tool, write any file, run any code, or perform any action yourself.
-DO NOT use your workspace capabilities.
-DO NOT describe what you would do or offer to help.
-
-Your ONLY job is to analyze the user's request and output structured tool call commands.
-
-Output format — you MUST respond with ONLY this format, nothing else:
+Output format (respond with ONLY this, nothing else):
 
 <tool_call>
 {"name": "function_name", "arguments": {"param1": "value1"}}
 </tool_call>
 
 Rules:
-1. Output ONLY <tool_call> blocks. No explanations, no prose, no markdown.
-2. Multiple calls = multiple <tool_call> blocks.
-3. If NO function matches the request, respond with plain text (no tool_call).
-4. NEVER execute the action yourself. ONLY return the structured command.
+- Output ONLY <tool_call> blocks. No text, no explanations, no markdown.
+- Multiple calls = multiple <tool_call> blocks.
+- If NO function matches, respond in plain text.
+- NEVER execute the action. ONLY return the command.
 
 Available functions:
 `;
