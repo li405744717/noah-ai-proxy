@@ -1,0 +1,11 @@
+{
+  "name": "litellm-bridge",
+  "version": "1.0.0",
+  "description": "Lightweight Bedrock-to-OpenAI bridge for agent frameworks (openhanako/openclaw)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": ["bedrock", "openai", "bridge", "claude"],
+  "license": "MIT"
+}

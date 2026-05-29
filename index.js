@@ -1,5 +1,5 @@
 /**
- * noah-ai-proxy v4.3 — OpenAI-compatible bridge via ai.noahgroup.com
+ * noah-ai-proxy v4.4 — OpenAI-compatible bridge via ai.noahgroup.com
  *
  * v4.3 improvements over v4.2:
  * - Smart prompt deduplication: system prompt + tools only sent once per session
@@ -62,14 +62,14 @@ class SessionPool {
     const existing = await this._fetchExisting(authToken, extraCookies, gptsId);
     console.log(`[Pool] Found ${existing.length} existing sessions`);
     for (const id of existing.slice(0, this.size)) {
-      this.sessions.push({ id, busy: false, useCount: 0, convId: null, sentCount: 0, systemHash: null, toolsHash: null, toolsInjected: false });
+      this.sessions.push({ id, busy: false, useCount: 0, convId: null, sentCount: 0, systemHash: null, toolsHash: null, toolsInjected: false, systemInjected: false });
     }
     const needed = this.size - this.sessions.length;
     if (needed > 0) {
       console.log(`[Pool] Creating ${needed} new sessions...`);
       const results = await Promise.allSettled(Array.from({ length: needed }, (_, i) => this._create(authToken, extraCookies, gptsId, this.sessions.length + i)));
       for (const r of results) {
-        if (r.status === "fulfilled") this.sessions.push({ id: r.value, busy: false, useCount: 0, convId: null, sentCount: 0, systemHash: null, toolsHash: null, toolsInjected: false });
+        if (r.status === "fulfilled") this.sessions.push({ id: r.value, busy: false, useCount: 0, convId: null, sentCount: 0, systemHash: null, toolsHash: null, toolsInjected: false, systemInjected: false });
         else console.error(`[Pool] Create failed: ${r.reason?.message}`);
       }
     }
@@ -97,7 +97,7 @@ class SessionPool {
     session.busy = false;
     if (this.waitQueue.length > 0) {
       const { resolve, convId } = this.waitQueue.shift();
-      if (session.convId !== convId) { session.convId = convId; session.sentCount = 0; session.systemHash = null; session.toolsHash = null; session.toolsInjected = false; }
+      if (session.convId !== convId) { session.convId = convId; session.sentCount = 0; session.systemHash = null; session.toolsHash = null; session.toolsInjected = false; session.systemInjected = false; session.systemHash = null; }
       session.busy = true; session.useCount++;
       resolve(session);
     }
@@ -131,7 +131,7 @@ const pool = new SessionPool(POOL_SIZE, "proxy-pool");
 // ─── Noah AI API ────────────────────────────────────────────────────────────
 
 function buildHeaders(authToken, extraCookies) {
-  return { "Content-Type": "application/json", Cookie: `NOAH_AI_AUTH_TOKEN=${authToken}${extraCookies ? "; " + extraCookies : ""}`, Origin: NOAH_BASE, Referer: `${NOAH_BASE}/home`, "User-Agent": "Mozilla/5.0 (compatible; noah-ai-proxy/4.3)", "request-id": uuid() };
+  return { "Content-Type": "application/json", Cookie: `NOAH_AI_AUTH_TOKEN=${authToken}${extraCookies ? "; " + extraCookies : ""}`, Origin: NOAH_BASE, Referer: `${NOAH_BASE}/home`, "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36", "request-id": uuid() };
 }
 
 function streamChatBody(authToken, sessionId, content, model) {
@@ -255,6 +255,33 @@ function parseToolCallsFromText(text) {
 
 function stripToolCalls(text) { return text.replace(/<tool_call>\s*[\s\S]*?\s*<\/tool_call>/g, "").trim(); }
 
+
+// ─── v4.4: System Prompt Chunked Injection ──────────────────────────────────
+
+function buildSystemPromptChunks(systemText) {
+  const prefixBytes = 80;
+  const maxContentBytes = MAX_CHUNK_BYTES - prefixBytes;
+  const paragraphs = systemText.split(/\n{2,}/);
+  const chunks = []; let current = ""; let currentBytes = 0;
+  for (const para of paragraphs) {
+    const paraWithSep = para + "\n\n";
+    const paraBytes = Buffer.byteLength(paraWithSep, 'utf-8');
+    if (currentBytes + paraBytes > maxContentBytes && current.length > 0) {
+      chunks.push(current.trim()); current = ""; currentBytes = 0;
+    }
+    if (paraBytes > maxContentBytes) {
+      const lines = para.split(/\n/);
+      for (const line of lines) {
+        const lb = Buffer.byteLength(line + "\n", 'utf-8');
+        if (currentBytes + lb > maxContentBytes && current.length > 0) { chunks.push(current.trim()); current = ""; currentBytes = 0; }
+        current += line + "\n"; currentBytes += lb;
+      }
+    } else { current += paraWithSep; currentBytes += paraBytes; }
+  }
+  if (current.trim()) chunks.push(current.trim());
+  return chunks.map((body, i) => `以下是我的工作背景和要求（第${i+1}部分，共${chunks.length}部分）：\n\n${body}`);
+}
+
 // ─── Message Formatting (v4.3: Smart Deduplication) ─────────────────────────
 
 function extractText(msg) {
@@ -279,12 +306,11 @@ function getConversationId(messages) {
  * Noah session already has all messages up to sentCount.
  * We only need to send messages[sentCount:] — but skip system (already sent in first turn).
  */
-function formatNewMessages(messages, sentCount, hasTools) {
-  // First turn: include system prompt
+function formatNewMessages(messages, sentCount, hasTools, includeSystem) {
+  // First turn: include system prompt only if small (v4.4)
   if (sentCount === 0) {
     const parts = [];
-    const sys = messages.find(m => m.role === "system");
-    if (sys) parts.push(`以下是我的工作背景：\n${extractText(sys)}`);
+    if (includeSystem) { const sys = messages.find(m => m.role === "system"); if (sys) parts.push(`以下是我的工作背景：\n${extractText(sys)}`); }
     
     // Include all non-system messages
     for (const msg of messages) {
@@ -370,7 +396,28 @@ async function handleCompletions(reqBody, authToken, extraCookies, res) {
   console.log(`[${completionId}] conv=${convId.slice(0,8)} sess=${session.id} sent=${session.sentCount} tools=${tools.length} needInject=${needToolReinject}`);
 
   try {
-    // Step 1: Inject tool schema if needed
+    // Step 1: Inject system prompt if large (v4.4)
+    const sysMsg = messages.find(m => m.role === "system");
+    const sysText = sysMsg ? extractText(sysMsg) : "";
+    const sysHash = sysText ? md5(sysText) : null;
+    const needSystemInject = sysText && (!session.systemInjected || session.systemHash !== sysHash);
+    const sysBytes = Buffer.byteLength(sysText, 'utf-8');
+    let sysInlineable = true;
+
+    if (needSystemInject && sysBytes > MAX_CHUNK_BYTES) {
+      const sysChunks = buildSystemPromptChunks(sysText);
+      console.log(`[${completionId}] Injecting system: ${sysBytes}B in ${sysChunks.length} chunks`);
+      for (let i = 0; i < sysChunks.length; i++) {
+        console.log(`[${completionId}]   sys ${i+1}/${sysChunks.length}: ${Buffer.byteLength(sysChunks[i],'utf-8')}B`);
+        await sendAndStop(authToken, session.id, sysChunks[i], model, extraCookies);
+      }
+      session.systemInjected = true; session.systemHash = sysHash; sysInlineable = false;
+      console.log(`[${completionId}] System injection done`);
+    } else if (needSystemInject) {
+      session.systemInjected = true; session.systemHash = sysHash;
+    }
+
+    // Step 2: Inject tool schema if needed
     if (needToolReinject) {
       const chunks = buildToolSchemaChunks(tools);
       console.log(`[${completionId}] Injecting ${chunks.length} tool schema chunk(s)...`);
@@ -383,8 +430,14 @@ async function handleCompletions(reqBody, authToken, extraCookies, res) {
       console.log(`[${completionId}] Tool schema injection complete`);
     }
 
-    // Step 2: Format and send only NEW messages
-    const content = formatNewMessages(messages, session.sentCount, hasTools);
+    // Step 3: Format and send only NEW messages
+    // v4.4 fix: detect new conversation reusing same system prompt
+    if (session.sentCount > 0 && session.sentCount >= messages.length) {
+      console.log(`[${completionId}] sentCount(${session.sentCount}) >= msgs(${messages.length}), resetting`);
+      session.sentCount = 0;
+    }
+    const includeSystem = (session.sentCount === 0 && sysInlineable && sysBytes <= MAX_CHUNK_BYTES);
+    const content = formatNewMessages(messages, session.sentCount, hasTools, includeSystem);
     if (!content) {
       pool.release(session);
       sendJson(res, 400, { error: { message: "No new messages to send", type: "invalid_request_error" } });
@@ -518,7 +571,7 @@ async function main() {
   const extraCookies = process.env.NOAH_EXTRA_COOKIES || "";
   try { await pool.init(authToken, extraCookies, DEFAULT_GPTS_ID); } catch (err) { console.error(`[Fatal] Pool init: ${err.message}`); process.exit(1); }
   server.listen(PORT, HOST, () => {
-    console.log(`\nnoah-ai-proxy v4.3 — Smart Deduplication`);
+    console.log(`\nnoah-ai-proxy v4.4 — Smart Deduplication`);
     console.log(`Listening: http://${HOST}:${PORT}`);
     console.log(`Upstream:  ${NOAH_BASE}`);
     console.log(`Pool:      ${pool.sessions.length} sessions (gptsId=${DEFAULT_GPTS_ID})`);
