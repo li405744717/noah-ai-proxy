@@ -559,8 +559,15 @@ const server = http.createServer(async (req, res) => {
     sendJson(res, 200, {
       object: "list",
       data: [
+        { id: "gpt-5.3", object: "model", created: 1700000000, owned_by: "noah-ai" },
         { id: "gpt-5.5", object: "model", created: 1700000000, owned_by: "noah-ai" },
+        { id: "gpt-5.4", object: "model", created: 1700000000, owned_by: "noah-ai" },
+        { id: "gpt-5.5-thinking", object: "model", created: 1700000000, owned_by: "noah-ai" },
+        { id: "gemini-3", object: "model", created: 1700000000, owned_by: "noah-ai" },
+        { id: "doubao-pro", object: "model", created: 1700000000, owned_by: "noah-ai" },
+        { id: "claude", object: "model", created: 1700000000, owned_by: "noah-ai" },
         { id: "us.anthropic.claude-opus-4-7", object: "model", created: 1700000000, owned_by: "noah-ai" },
+        { id: "Qwen-27B", object: "model", created: 1700000000, owned_by: "noah-ai" },
       ],
     });
 
