@@ -507,13 +507,14 @@ function collectResponse(upstream) {
   return new Promise((resolve, reject) => {
     let full = "";
     let resolved = false;
-    const done = (src) => { if (!resolved) { resolved = true; console.log(`[collectResponse] resolved via ${src}, length=${full.length}`); resolve(full); } };
+    let rawChunks = [];
+    const done = (src) => { if (!resolved) { resolved = true; console.log(`[collectResponse] resolved via ${src}, length=${full.length}`); if (full.length === 0 && rawChunks.length > 0) { console.log(`[collectResponse] RAW upstream (first 500): ${rawChunks.join('').slice(0, 500)}`); } resolve(full); } };
     const parser = new NoahSSEParser({
       onText: (text) => { full += text; },
       onDone: () => { done("sse-done"); },
       onError: (err) => { if (!resolved) { resolved = true; reject(err); } },
     });
-    upstream.on("data", (chunk) => parser.feed(chunk.toString("utf-8")));
+    upstream.on("data", (chunk) => { const s = chunk.toString("utf-8"); rawChunks.push(s); parser.feed(s); });
     upstream.on("end", () => { parser.flush(); done("stream-end"); });
     upstream.on("error", (err) => { if (!resolved) { resolved = true; reject(err); } });
   });
