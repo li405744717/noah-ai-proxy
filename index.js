@@ -548,7 +548,8 @@ const server = http.createServer(async (req, res) => {
     const msgCount = (params.messages || []).length;
     const toolCount = (params.tools || []).length;
     const lastMsg = (params.messages || []).slice(-1)[0];
-    const preview = lastMsg ? `${lastMsg.role}: ${(lastMsg.content || "").slice(0, 60)}` : "empty";
+    const rawContent = lastMsg?.content;
+    const preview = lastMsg ? `${lastMsg.role}: ${typeof rawContent === "string" ? rawContent.slice(0, 60) : JSON.stringify(rawContent).slice(0, 60)}` : "empty";
     console.log(`[${reqTime}] → POST /v1/chat/completions model=${params.model || DEFAULT_MODEL} stream=${!!params.stream} msgs=${msgCount} tools=${toolCount}`);
     console.log(`[${reqTime}]   last: ${preview}`);
 
