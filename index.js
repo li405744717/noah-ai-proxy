@@ -442,9 +442,11 @@ async function handleCompletions(reqBody, authToken, extraCookies, res) {
 
   const completionId = shortId();
   const session = await pool.acquire();
+  console.log(`[Req ${completionId}] session=${session.id} model=${model} hasTools=${hasTools}`);
 
   try {
     const upstream = await callStreamChat(authToken, session.id, content, model, extraCookies);
+    console.log(`[Req ${completionId}] upstream status=${upstream.statusCode}`);
 
     if (stream && !hasTools) {
       res.writeHead(200, {
@@ -533,6 +535,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   const url = req.url.split("?")[0];
+  const reqTime = new Date().toLocaleTimeString();
 
   if (url === "/v1/chat/completions" && req.method === "POST") {
     let body = "";
@@ -540,18 +543,26 @@ const server = http.createServer(async (req, res) => {
 
     let params;
     try { params = JSON.parse(body); }
-    catch { sendJson(res, 400, { error: { message: "Invalid JSON", type: "invalid_request_error" } }); return; }
+    catch { console.log(`[${reqTime}] ← 400 Invalid JSON`); sendJson(res, 400, { error: { message: "Invalid JSON", type: "invalid_request_error" } }); return; }
+
+    const msgCount = (params.messages || []).length;
+    const toolCount = (params.tools || []).length;
+    const lastMsg = (params.messages || []).slice(-1)[0];
+    const preview = lastMsg ? `${lastMsg.role}: ${(lastMsg.content || "").slice(0, 60)}` : "empty";
+    console.log(`[${reqTime}] → POST /v1/chat/completions model=${params.model || DEFAULT_MODEL} stream=${!!params.stream} msgs=${msgCount} tools=${toolCount}`);
+    console.log(`[${reqTime}]   last: ${preview}`);
 
     const authHeader = req.headers["authorization"] || "";
     const authToken = req.headers["x-auth-token"] || (authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "") || process.env.NOAH_AUTH_TOKEN || "";
-    if (!authToken) { sendJson(res, 401, { error: { message: "Missing auth token", type: "authentication_error" } }); return; }
+    if (!authToken) { console.log(`[${reqTime}] ← 401 No token`); sendJson(res, 401, { error: { message: "Missing auth token", type: "authentication_error" } }); return; }
 
     const extraCookies = req.headers["x-extra-cookies"] || params.extra_cookies || process.env.NOAH_EXTRA_COOKIES || "";
 
-    if (!pool.initialized) { sendJson(res, 503, { error: { message: "Session pool not ready", type: "server_error" } }); return; }
+    if (!pool.initialized) { console.log(`[${reqTime}] ← 503 Pool not ready`); sendJson(res, 503, { error: { message: "Session pool not ready", type: "server_error" } }); return; }
 
-    try { await handleCompletions(params, authToken, extraCookies, res); }
+    try { await handleCompletions(params, authToken, extraCookies, res); console.log(`[${reqTime}] ← 200 OK`); }
     catch (err) {
+      console.error(`[${reqTime}] ← 500 Error: ${err.message}`);
       if (!res.headersSent) sendJson(res, 500, { error: { message: err.message, type: "server_error" } });
     }
 
