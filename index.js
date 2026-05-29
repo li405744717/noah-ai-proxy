@@ -69,33 +69,17 @@ class SessionPool {
   }
 
   async init(authToken, extraCookies, gptsId) {
-    // Step 1: Load persisted sessions
-    const saved = this._loadFromDisk();
-    console.log(`[Pool] Found ${saved.length} persisted sessions`);
+    // Step 1: Fetch existing proxy sessions from server
+    const existing = await this._fetchExistingSessions(authToken, extraCookies);
+    console.log(`[Pool] Found ${existing.length} existing proxy-pool sessions on server`);
 
-    // Step 2: Validate persisted sessions are still alive
-    const valid = [];
-    if (saved.length > 0) {
-      console.log(`[Pool] Validating persisted sessions...`);
-      const checks = await Promise.allSettled(
-        saved.map((id) => this._validateSession(authToken, extraCookies, id))
-      );
-      for (let i = 0; i < checks.length; i++) {
-        if (checks[i].status === "fulfilled" && checks[i].value) {
-          valid.push(saved[i]);
-          console.log(`[Pool] Session ${saved[i]} — valid ✓`);
-        } else {
-          console.log(`[Pool] Session ${saved[i]} — invalid ✗ (will create new)`);
-        }
-      }
-    }
-
-    // Step 3: Add validated sessions to pool
-    for (const id of valid.slice(0, this.size)) {
+    // Step 2: Use existing sessions (up to pool size)
+    for (const id of existing.slice(0, this.size)) {
       this.sessions.push({ id, busy: false, createdAt: Date.now(), useCount: 0 });
+      console.log(`[Pool] Reusing session: ${id}`);
     }
 
-    // Step 4: Create missing sessions to fill the pool
+    // Step 3: Create missing sessions to fill the pool
     const needed = this.size - this.sessions.length;
     if (needed > 0) {
       console.log(`[Pool] Creating ${needed} new sessions...`);
@@ -114,7 +98,7 @@ class SessionPool {
       }
     }
 
-    // Step 5: Persist to disk
+    // Step 4: Persist to local file as fallback
     this._saveToDisk();
 
     this.initialized = true;
@@ -125,11 +109,36 @@ class SessionPool {
     }
   }
 
+  async _fetchExistingSessions(authToken, extraCookies) {
+    try {
+      const headers = buildHeaders(authToken, extraCookies);
+      // GET request — no body
+      const res = await httpsReq(
+        `${NOAH_BASE}/api/noah-chat-svc/session/listSessionRecord?pageNo=1&pageSize=50`,
+        { method: "GET", headers },
+        null
+      );
+      if (res.status === 200 && res.body?.code === 200 && Array.isArray(res.body.data)) {
+        return res.body.data
+          .filter((r) => r.name && r.name.startsWith("proxy-pool-"))
+          .map((r) => r.id)
+          .filter(Boolean);
+      }
+      return this._loadFromDisk();
+    } catch (err) {
+      console.warn(`[Pool] Failed to fetch sessions from server: ${err.message}`);
+      return this._loadFromDisk();
+    }
+  }
+
   _loadFromDisk() {
     try {
       if (fs.existsSync(POOL_FILE)) {
         const data = JSON.parse(fs.readFileSync(POOL_FILE, "utf-8"));
-        if (Array.isArray(data.sessionIds)) return data.sessionIds;
+        if (Array.isArray(data.sessionIds)) {
+          console.log(`[Pool] Loaded ${data.sessionIds.length} sessions from local fallback`);
+          return data.sessionIds;
+        }
       }
     } catch (err) {
       console.warn(`[Pool] Failed to read ${POOL_FILE}: ${err.message}`);
@@ -141,21 +150,9 @@ class SessionPool {
     try {
       const data = { sessionIds: this.sessions.map((s) => s.id), updatedAt: new Date().toISOString() };
       fs.writeFileSync(POOL_FILE, JSON.stringify(data, null, 2), "utf-8");
-      console.log(`[Pool] Persisted ${data.sessionIds.length} sessions to .sessions.json`);
     } catch (err) {
       console.warn(`[Pool] Failed to write ${POOL_FILE}: ${err.message}`);
     }
-  }
-
-  async _validateSession(authToken, extraCookies, sessionId) {
-    // Use listChatRecord to verify the session still exists
-    const headers = buildHeaders(authToken, extraCookies);
-    const res = await httpsReq(
-      `${NOAH_BASE}/api/noah-chat-svc/chat/listChatRecord`,
-      { method: "POST", headers },
-      { offset: 0, sessionId, pageNo: 1, pageSize: 1 }
-    );
-    return res.status === 200 && res.body?.code === 200;
   }
 
   acquire() {
