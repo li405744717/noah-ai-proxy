@@ -416,7 +416,15 @@ function formatMessages(messages, tools) {
   }
 
   if (hasTools) {
-    parts.push(`[Reminder] You MUST NOT execute the task yourself. Do NOT create files, run code, or use workspace tools. Analyze the user's intent and respond ONLY with <tool_call> blocks matching the available functions above. Output nothing else.`);
+    const lastMsg = messages[messages.length - 1];
+    if (lastMsg && lastMsg.role === "tool") {
+      parts.push(`[Reminder] The tool has finished executing. Based on the result above, decide your next step:
+- If more actions are needed to fulfill the user's original request, output additional <tool_call> blocks.
+- If the task is complete, provide a brief text summary of what was accomplished.
+Do NOT execute actions yourself. Only use <tool_call> blocks for actions.`);
+    } else {
+      parts.push(`[Reminder] You MUST NOT execute the task yourself. Do NOT create files, run code, or use workspace tools. Analyze the user's intent and respond ONLY with <tool_call> blocks matching the available functions above. Output nothing else.`);
+    }
   }
 
   return parts.join("\n\n");
