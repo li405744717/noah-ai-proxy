@@ -1,8 +1,8 @@
 /**
- * noah-ai-proxy v2.1 — OpenAI-compatible bridge via ai.noahgroup.com
+ * noah-ai-proxy v2.2 — OpenAI-compatible bridge via ai.noahgroup.com
  *
  * Features:
- * - Fixed session pool (10 sessions, created at startup, reused across requests)
+ * - Dual session pool: workspace (gptsId=87) for general + LLM (gptsId=76) for tool-calling
  * - Concurrent request handling with pool-based session allocation
  * - Full OpenAI Chat Completions API compatibility
  */
@@ -20,6 +20,7 @@ const DEFAULT_MODEL = "gpt-5.5";
 const DEFAULT_GPTS_ID = parseInt(process.env.GPTS_ID || "87", 10);
 const DEFAULT_SKILL_NAME = process.env.SKILL_NAME || "tool-skills-creator";
 const POOL_SIZE = parseInt(process.env.POOL_SIZE || "10", 10);
+const LLM_GPTS_ID = 76; // Pure LLM — no workspace, forces tool_call output format
 
 // ─── Utility ────────────────────────────────────────────────────────────────
 
@@ -62,8 +63,9 @@ function httpsReq(url, opts, body) {
 const POOL_FILE = path.join(__dirname, ".sessions.json");
 
 class SessionPool {
-  constructor(size) {
+  constructor(size, prefix = "proxy-pool") {
     this.size = size;
+    this.prefix = prefix;
     this.sessions = [];       // [{id, busy, createdAt, useCount}]
     this.waitQueue = [];      // callbacks waiting for a free session
     this.initialized = false;
@@ -120,7 +122,7 @@ class SessionPool {
       );
       if (res.status === 200 && res.body?.code === 200 && Array.isArray(res.body.data)) {
         return res.body.data
-          .filter((r) => r.name && r.name.startsWith("proxy-pool-") && r.gptsId === gptsId)
+          .filter((r) => r.name && r.name.startsWith(`${this.prefix}-`) && r.gptsId === gptsId)
           .map((r) => r.id)
           .filter(Boolean);
       }
@@ -191,7 +193,7 @@ class SessionPool {
 
   async _createSession(authToken, extraCookies, gptsId, index) {
     const headers = buildHeaders(authToken, extraCookies);
-    const body = { gptsId, sessionName: `proxy-pool-${index}` };
+    const body = { gptsId, sessionName: `${this.prefix}-${index}` };
     // gptsId 87 = Claude SDK with workspace (supports tool call + file generation)
     if (gptsId === 87) {
       body.skillName = DEFAULT_SKILL_NAME;
@@ -208,7 +210,9 @@ class SessionPool {
   }
 }
 
-const pool = new SessionPool(POOL_SIZE);
+const pool = new SessionPool(POOL_SIZE, "proxy-pool");
+const LLM_POOL_SIZE = parseInt(process.env.LLM_POOL_SIZE || "3", 10);
+const llmPool = new SessionPool(LLM_POOL_SIZE, "proxy-llm");
 
 // ─── Noah AI API ────────────────────────────────────────────────────────────
 
@@ -430,8 +434,9 @@ async function handleCompletions(reqBody, authToken, extraCookies, res) {
 
   const completionId = shortId();
 
-  // Acquire session from pool
-  const session = await pool.acquire();
+  // Use LLM pool for tool-calling (prevents workspace session from executing tools itself)
+  const activePool = hasTools ? llmPool : pool;
+  const session = await activePool.acquire();
 
   try {
     const upstream = await callStreamChat(authToken, session.id, content, model, extraCookies);
@@ -445,17 +450,17 @@ async function handleCompletions(reqBody, authToken, extraCookies, res) {
 
       const parser = new NoahSSEParser({
         onText: (text) => { if (!res.writableEnded) writeSse(res, openaiChunk(completionId, model, text, null)); },
-        onDone: () => { pool.release(session); finishStream(res, completionId, model); },
-        onError: (err) => { pool.release(session); if (!res.writableEnded) { writeSse(res, { error: { message: err.message } }); res.write("data: [DONE]\n\n"); res.end(); } },
+        onDone: () => { activePool.release(session); finishStream(res, completionId, model); },
+        onError: (err) => { activePool.release(session); if (!res.writableEnded) { writeSse(res, { error: { message: err.message } }); res.write("data: [DONE]\n\n"); res.end(); } },
       });
 
       upstream.on("data", (chunk) => parser.feed(chunk.toString("utf-8")));
-      upstream.on("end", () => { parser.flush(); if (!parser.done) { pool.release(session); finishStream(res, completionId, model); } });
-      upstream.on("error", (err) => { pool.release(session); if (!res.writableEnded) { writeSse(res, { error: { message: err.message } }); res.end(); } });
+      upstream.on("end", () => { parser.flush(); if (!parser.done) { activePool.release(session); finishStream(res, completionId, model); } });
+      upstream.on("error", (err) => { activePool.release(session); if (!res.writableEnded) { writeSse(res, { error: { message: err.message } }); res.end(); } });
 
     } else {
       const fullText = await collectResponse(upstream);
-      pool.release(session);
+      activePool.release(session);
 
       let toolCalls = [];
       let responseContent = fullText;
@@ -481,7 +486,7 @@ async function handleCompletions(reqBody, authToken, extraCookies, res) {
       }
     }
   } catch (err) {
-    pool.release(session);
+    activePool.release(session);
     if (!res.headersSent) sendJson(res, 500, { error: { message: err.message, type: "server_error" } });
     else if (!res.writableEnded) { res.write(`data: ${JSON.stringify({ error: { message: err.message } })}\n\n`); res.end(); }
   }
@@ -538,7 +543,7 @@ const server = http.createServer(async (req, res) => {
 
     const extraCookies = req.headers["x-extra-cookies"] || params.extra_cookies || process.env.NOAH_EXTRA_COOKIES || "";
 
-    if (!pool.initialized) { sendJson(res, 503, { error: { message: "Session pool not ready", type: "server_error" } }); return; }
+    if (!pool.initialized || !llmPool.initialized) { sendJson(res, 503, { error: { message: "Session pool not ready", type: "server_error" } }); return; }
 
     try { await handleCompletions(params, authToken, extraCookies, res); }
     catch (err) {
@@ -558,7 +563,7 @@ const server = http.createServer(async (req, res) => {
     });
 
   } else if (url === "/health" || url === "/pool") {
-    sendJson(res, 200, { status: "ok", version: "2.1.0", upstream: NOAH_BASE, pool: pool.stats() });
+    sendJson(res, 200, { status: "ok", version: "2.2.0", upstream: NOAH_BASE, pool: pool.stats(), llmPool: llmPool.stats() });
 
   } else {
     sendJson(res, 404, { error: { message: "Not found", type: "invalid_request_error" } });
@@ -578,16 +583,18 @@ async function main() {
 
   try {
     await pool.init(authToken, extraCookies, DEFAULT_GPTS_ID);
+    await llmPool.init(authToken, extraCookies, LLM_GPTS_ID);
   } catch (err) {
     console.error(`[Fatal] Pool init failed: ${err.message}`);
     process.exit(1);
   }
 
   server.listen(PORT, HOST, () => {
-    console.log(`\nnoah-ai-proxy v2.1 — Session Pool Mode`);
+    console.log(`\nnoah-ai-proxy v2.2 — Dual Pool Mode`);
     console.log(`Listening: http://${HOST}:${PORT}`);
     console.log(`Upstream:  ${NOAH_BASE}`);
-    console.log(`Pool:      ${pool.sessions.length} sessions ready`);
+    console.log(`Pool:      ${pool.sessions.length} workspace sessions (gptsId=${DEFAULT_GPTS_ID})`);
+    console.log(`LLM Pool:  ${llmPool.sessions.length} pure-LLM sessions (gptsId=${LLM_GPTS_ID}) for tool-calling`);
     console.log(`\nEndpoints:`);
     console.log(`  POST /v1/chat/completions`);
     console.log(`  GET  /v1/models`);
