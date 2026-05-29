@@ -1,8 +1,10 @@
 /**
- * noah-ai-proxy — OpenAI-compatible bridge via ai.noahgroup.com (compliant path)
+ * noah-ai-proxy v2.1 — OpenAI-compatible bridge via ai.noahgroup.com
  *
- * Converts OpenAI /v1/chat/completions format ↔ Noah AI streamChat API.
- * Runs on your local machine, communicates only with the approved public domain.
+ * Features:
+ * - Fixed session pool (10 sessions, created at startup, reused across requests)
+ * - Concurrent request handling with pool-based session allocation
+ * - Full OpenAI Chat Completions API compatibility
  */
 
 const http = require("http");
@@ -13,7 +15,8 @@ const PORT = parseInt(process.env.PORT || "4000", 10);
 const HOST = process.env.HOST || "127.0.0.1";
 const NOAH_BASE = process.env.NOAH_BASE || "https://ai.noahgroup.com";
 const DEFAULT_MODEL = "gpt-5.5";
-const DEFAULT_GPTS_ID = 76;
+const DEFAULT_GPTS_ID = parseInt(process.env.GPTS_ID || "76", 10);
+const POOL_SIZE = parseInt(process.env.POOL_SIZE || "10", 10);
 
 // ─── Utility ────────────────────────────────────────────────────────────────
 
@@ -51,6 +54,91 @@ function httpsReq(url, opts, body) {
   });
 }
 
+// ─── Session Pool ───────────────────────────────────────────────────────────
+
+class SessionPool {
+  constructor(size) {
+    this.size = size;
+    this.sessions = [];       // [{id, busy, createdAt, useCount}]
+    this.waitQueue = [];      // callbacks waiting for a free session
+    this.initialized = false;
+  }
+
+  async init(authToken, extraCookies, gptsId) {
+    console.log(`[Pool] Initializing ${this.size} sessions...`);
+    const results = await Promise.allSettled(
+      Array.from({ length: this.size }, (_, i) =>
+        this._createSession(authToken, extraCookies, gptsId, i)
+      )
+    );
+
+    for (let i = 0; i < results.length; i++) {
+      if (results[i].status === "fulfilled") {
+        this.sessions.push({ id: results[i].value, busy: false, createdAt: Date.now(), useCount: 0 });
+        console.log(`[Pool] Session ${i + 1}/${this.size} created: ${results[i].value}`);
+      } else {
+        console.error(`[Pool] Session ${i + 1}/${this.size} FAILED: ${results[i].reason?.message}`);
+      }
+    }
+
+    this.initialized = true;
+    console.log(`[Pool] Ready: ${this.sessions.length}/${this.size} sessions available`);
+
+    if (this.sessions.length === 0) {
+      throw new Error("Failed to create any sessions");
+    }
+  }
+
+  acquire() {
+    const free = this.sessions.find((s) => !s.busy);
+    if (free) {
+      free.busy = true;
+      free.useCount++;
+      return Promise.resolve(free);
+    }
+    // All busy — queue the request
+    return new Promise((resolve) => {
+      this.waitQueue.push(resolve);
+    });
+  }
+
+  release(session) {
+    session.busy = false;
+    // If someone is waiting, give them this session immediately
+    if (this.waitQueue.length > 0) {
+      const next = this.waitQueue.shift();
+      session.busy = true;
+      session.useCount++;
+      next(session);
+    }
+  }
+
+  stats() {
+    const busy = this.sessions.filter((s) => s.busy).length;
+    return {
+      total: this.sessions.length,
+      busy,
+      free: this.sessions.length - busy,
+      waiting: this.waitQueue.length,
+    };
+  }
+
+  async _createSession(authToken, extraCookies, gptsId, index) {
+    const headers = buildHeaders(authToken, extraCookies);
+    const res = await httpsReq(
+      `${NOAH_BASE}/api/noah-chat-svc/session/createSession`,
+      { method: "POST", headers },
+      { gptsId, sessionName: `proxy-pool-${index}` }
+    );
+    if (res.status === 200 && res.body?.code === 200 && res.body.data) {
+      return res.body.data.sessionId || res.body.data.id || res.body.data;
+    }
+    throw new Error(`createSession failed: ${JSON.stringify(res.body).slice(0, 200)}`);
+  }
+}
+
+const pool = new SessionPool(POOL_SIZE);
+
 // ─── Noah AI API ────────────────────────────────────────────────────────────
 
 function buildHeaders(authToken, extraCookies) {
@@ -59,21 +147,9 @@ function buildHeaders(authToken, extraCookies) {
     Cookie: `NOAH_AI_AUTH_TOKEN=${authToken}${extraCookies ? "; " + extraCookies : ""}`,
     Origin: NOAH_BASE,
     Referer: `${NOAH_BASE}/home`,
-    "User-Agent": "Mozilla/5.0 (compatible; noah-ai-proxy/2.0)",
+    "User-Agent": "Mozilla/5.0 (compatible; noah-ai-proxy/2.1)",
     "request-id": uuid(),
   };
-}
-
-async function createSession(authToken, gptsId, extraCookies) {
-  const res = await httpsReq(
-    `${NOAH_BASE}/api/noah-chat-svc/session/createSession`,
-    { method: "POST", headers: buildHeaders(authToken, extraCookies) },
-    { gptsId, sessionName: "proxy-session" }
-  );
-  if (res.status === 200 && res.body?.code === 200 && res.body.data) {
-    return res.body.data.sessionId || res.body.data.id || res.body.data;
-  }
-  throw new Error(`createSession failed: ${JSON.stringify(res.body).slice(0, 200)}`);
 }
 
 async function callStreamChat(authToken, sessionId, content, model, extraCookies) {
@@ -105,9 +181,11 @@ class NoahSSEParser {
     this.onText = onText;
     this.onDone = onDone;
     this.onError = onError;
+    this.done = false;
   }
 
   feed(raw) {
+    if (this.done) return;
     this.buffer += raw;
     const blocks = this.buffer.split("\n\n");
     this.buffer = blocks.pop() || "";
@@ -115,20 +193,21 @@ class NoahSSEParser {
   }
 
   flush() {
+    if (this.done) return;
     if (this.buffer.trim()) { this._parse(this.buffer.trim()); this.buffer = ""; }
   }
 
   _parse(block) {
-    if (!block) return;
+    if (!block || this.done) return;
     let eventType = "", dataLine = "";
     for (const line of block.split("\n")) {
       if (line.startsWith("event:")) eventType = line.slice(6).trim();
       else if (line.startsWith("data:")) dataLine = line.slice(5).trim();
     }
     if (eventType === "end" || eventType === "stop" || eventType === "done" || dataLine === "[DONE]") {
-      this.onDone(); return;
+      this.done = true; this.onDone(); return;
     }
-    if (eventType === "error") { this.onError(new Error(dataLine || "upstream error")); return; }
+    if (eventType === "error") { this.done = true; this.onError(new Error(dataLine || "upstream error")); return; }
     if (!dataLine) return;
     try {
       const d = JSON.parse(dataLine);
@@ -159,26 +238,12 @@ function openaiToolCallChunks(id, model, toolCalls) {
   for (let i = 0; i < toolCalls.length; i++) {
     const tc = toolCalls[i];
     chunks.push({
-      id: `chatcmpl-${id}`,
-      object: "chat.completion.chunk",
-      created: Math.floor(Date.now() / 1000),
-      model,
-      choices: [{
-        index: 0,
-        delta: { tool_calls: [{ index: i, id: tc.id, type: "function", function: { name: tc.function.name, arguments: "" } }] },
-        finish_reason: null,
-      }],
+      id: `chatcmpl-${id}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model,
+      choices: [{ index: 0, delta: { tool_calls: [{ index: i, id: tc.id, type: "function", function: { name: tc.function.name, arguments: "" } }] }, finish_reason: null }],
     });
     chunks.push({
-      id: `chatcmpl-${id}`,
-      object: "chat.completion.chunk",
-      created: Math.floor(Date.now() / 1000),
-      model,
-      choices: [{
-        index: 0,
-        delta: { tool_calls: [{ index: i, function: { arguments: tc.function.arguments } }] },
-        finish_reason: null,
-      }],
+      id: `chatcmpl-${id}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model,
+      choices: [{ index: 0, delta: { tool_calls: [{ index: i, function: { arguments: tc.function.arguments } }] }, finish_reason: null }],
     });
   }
   return chunks;
@@ -193,15 +258,8 @@ function openaiResponse(id, model, content, toolCalls) {
     message.content = content;
   }
   return {
-    id: `chatcmpl-${id}`,
-    object: "chat.completion",
-    created: Math.floor(Date.now() / 1000),
-    model,
-    choices: [{
-      index: 0,
-      message,
-      finish_reason: toolCalls?.length > 0 ? "tool_calls" : "stop",
-    }],
+    id: `chatcmpl-${id}`, object: "chat.completion", created: Math.floor(Date.now() / 1000), model,
+    choices: [{ index: 0, message, finish_reason: toolCalls?.length > 0 ? "tool_calls" : "stop" }],
     usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
   };
 }
@@ -262,25 +320,19 @@ function stripToolCalls(text) {
 
 function formatMessages(messages, tools) {
   const parts = [];
-
-  if (tools && tools.length > 0) {
-    parts.push(buildToolSystemPrompt(tools));
-  }
+  if (tools && tools.length > 0) parts.push(buildToolSystemPrompt(tools));
 
   for (const msg of messages) {
-    const role = msg.role;
-    if (role === "system") {
-      parts.push(`[System]\n${extractText(msg)}`);
-    } else if (role === "user") {
-      parts.push(`[User]\n${extractText(msg)}`);
-    } else if (role === "assistant") {
+    if (msg.role === "system") parts.push(`[System]\n${extractText(msg)}`);
+    else if (msg.role === "user") parts.push(`[User]\n${extractText(msg)}`);
+    else if (msg.role === "assistant") {
       if (msg.content) parts.push(`[Assistant]\n${msg.content}`);
       if (msg.tool_calls) {
         for (const tc of msg.tool_calls) {
           parts.push(`[Assistant Tool Call]\n<tool_call>\n{"name":"${tc.function.name}","arguments":${tc.function.arguments}}\n</tool_call>`);
         }
       }
-    } else if (role === "tool") {
+    } else if (msg.role === "tool") {
       parts.push(`[Tool Result (${msg.name || msg.tool_call_id || "?"})]\n${msg.content}`);
     }
   }
@@ -289,9 +341,7 @@ function formatMessages(messages, tools) {
 
 function extractText(msg) {
   if (typeof msg.content === "string") return msg.content;
-  if (Array.isArray(msg.content)) {
-    return msg.content.filter((p) => p.type === "text").map((p) => p.text).join("\n");
-  }
+  if (Array.isArray(msg.content)) return msg.content.filter((p) => p.type === "text").map((p) => p.text).join("\n");
   return String(msg.content || "");
 }
 
@@ -303,90 +353,66 @@ async function handleCompletions(reqBody, authToken, extraCookies, res) {
   const messages = reqBody.messages || [];
   const tools = reqBody.tools || [];
   const hasTools = tools.length > 0;
-  const gptsId = reqBody.gpts_id || DEFAULT_GPTS_ID;
 
   const content = formatMessages(messages, tools);
-  if (!content) {
-    sendJson(res, 400, { error: { message: "No message content", type: "invalid_request_error" } });
-    return;
-  }
+  if (!content) { sendJson(res, 400, { error: { message: "No message content", type: "invalid_request_error" } }); return; }
 
   const completionId = shortId();
 
-  const sessionId = await createSession(authToken, gptsId, extraCookies);
-  const upstream = await callStreamChat(authToken, sessionId, content, model, extraCookies);
+  // Acquire session from pool
+  const session = await pool.acquire();
 
-  if (stream && !hasTools) {
-    // Pure streaming — no tool calling
-    res.writeHead(200, {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive",
-      "Access-Control-Allow-Origin": "*",
-      "X-Accel-Buffering": "no",
-    });
+  try {
+    const upstream = await callStreamChat(authToken, session.id, content, model, extraCookies);
 
-    // Initial role chunk
-    writeSse(res, { id: `chatcmpl-${completionId}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
-
-    const parser = new NoahSSEParser({
-      onText: (text) => { if (!res.writableEnded) writeSse(res, openaiChunk(completionId, model, text, null)); },
-      onDone: () => { finishStream(res, completionId, model); },
-      onError: (err) => {
-        if (!res.writableEnded) {
-          writeSse(res, { error: { message: err.message } });
-          res.write("data: [DONE]\n\n");
-          res.end();
-        }
-      },
-    });
-
-    upstream.on("data", (chunk) => parser.feed(chunk.toString("utf-8")));
-    upstream.on("end", () => { parser.flush(); finishStream(res, completionId, model); });
-    upstream.on("error", (err) => { if (!res.writableEnded) { writeSse(res, { error: { message: err.message } }); res.end(); } });
-
-  } else {
-    // Collect full response (needed for tool call detection or non-stream)
-    const fullText = await collectResponse(upstream);
-
-    let toolCalls = [];
-    let responseContent = fullText;
-
-    if (hasTools) {
-      toolCalls = parseToolCallsFromText(fullText);
-      if (toolCalls.length > 0) {
-        responseContent = stripToolCalls(fullText) || null;
-      }
-    }
-
-    if (stream) {
-      // Stream mode with tool calls — simulate streaming after collection
+    if (stream && !hasTools) {
       res.writeHead(200, {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-        "Access-Control-Allow-Origin": "*",
-        "X-Accel-Buffering": "no",
+        "Content-Type": "text/event-stream", "Cache-Control": "no-cache",
+        Connection: "keep-alive", "Access-Control-Allow-Origin": "*", "X-Accel-Buffering": "no",
       });
-
       writeSse(res, { id: `chatcmpl-${completionId}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
 
-      if (toolCalls.length > 0) {
-        for (const chunk of openaiToolCallChunks(completionId, model, toolCalls)) {
-          writeSse(res, chunk);
-        }
-        writeSse(res, { id: `chatcmpl-${completionId}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
-      } else {
-        if (responseContent) writeSse(res, openaiChunk(completionId, model, responseContent, null));
-        writeSse(res, openaiChunk(completionId, model, null, "stop"));
-      }
-      res.write("data: [DONE]\n\n");
-      res.end();
+      const parser = new NoahSSEParser({
+        onText: (text) => { if (!res.writableEnded) writeSse(res, openaiChunk(completionId, model, text, null)); },
+        onDone: () => { pool.release(session); finishStream(res, completionId, model); },
+        onError: (err) => { pool.release(session); if (!res.writableEnded) { writeSse(res, { error: { message: err.message } }); res.write("data: [DONE]\n\n"); res.end(); } },
+      });
+
+      upstream.on("data", (chunk) => parser.feed(chunk.toString("utf-8")));
+      upstream.on("end", () => { parser.flush(); if (!parser.done) { pool.release(session); finishStream(res, completionId, model); } });
+      upstream.on("error", (err) => { pool.release(session); if (!res.writableEnded) { writeSse(res, { error: { message: err.message } }); res.end(); } });
 
     } else {
-      // Non-stream
-      sendJson(res, 200, openaiResponse(completionId, model, responseContent, toolCalls.length > 0 ? toolCalls : null));
+      const fullText = await collectResponse(upstream);
+      pool.release(session);
+
+      let toolCalls = [];
+      let responseContent = fullText;
+      if (hasTools) {
+        toolCalls = parseToolCallsFromText(fullText);
+        if (toolCalls.length > 0) responseContent = stripToolCalls(fullText) || null;
+      }
+
+      if (stream) {
+        res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive", "Access-Control-Allow-Origin": "*", "X-Accel-Buffering": "no" });
+        writeSse(res, { id: `chatcmpl-${completionId}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
+
+        if (toolCalls.length > 0) {
+          for (const chunk of openaiToolCallChunks(completionId, model, toolCalls)) writeSse(res, chunk);
+          writeSse(res, { id: `chatcmpl-${completionId}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
+        } else {
+          if (responseContent) writeSse(res, openaiChunk(completionId, model, responseContent, null));
+          writeSse(res, openaiChunk(completionId, model, null, "stop"));
+        }
+        res.write("data: [DONE]\n\n"); res.end();
+      } else {
+        sendJson(res, 200, openaiResponse(completionId, model, responseContent, toolCalls.length > 0 ? toolCalls : null));
+      }
     }
+  } catch (err) {
+    pool.release(session);
+    if (!res.headersSent) sendJson(res, 500, { error: { message: err.message, type: "server_error" } });
+    else if (!res.writableEnded) { res.write(`data: ${JSON.stringify({ error: { message: err.message } })}\n\n`); res.end(); }
   }
 }
 
@@ -411,10 +437,7 @@ function finishStream(res, id, model) {
   res.end();
 }
 
-function writeSse(res, data) {
-  res.write(`data: ${JSON.stringify(data)}\n\n`);
-}
-
+function writeSse(res, data) { res.write(`data: ${JSON.stringify(data)}\n\n`); }
 function sendJson(res, status, data) {
   res.writeHead(status, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
   res.end(JSON.stringify(data));
@@ -423,21 +446,14 @@ function sendJson(res, status, data) {
 // ─── HTTP Server ────────────────────────────────────────────────────────────
 
 const server = http.createServer(async (req, res) => {
-  // CORS preflight
   if (req.method === "OPTIONS") {
-    res.writeHead(204, {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization, x-auth-token, x-extra-cookies",
-    });
-    res.end();
-    return;
+    res.writeHead(204, { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type, Authorization, x-auth-token, x-extra-cookies" });
+    res.end(); return;
   }
 
   const url = req.url.split("?")[0];
 
   if (url === "/v1/chat/completions" && req.method === "POST") {
-    // Parse body
     let body = "";
     await new Promise((r) => { req.on("data", (c) => (body += c)); req.on("end", r); });
 
@@ -445,22 +461,17 @@ const server = http.createServer(async (req, res) => {
     try { params = JSON.parse(body); }
     catch { sendJson(res, 400, { error: { message: "Invalid JSON", type: "invalid_request_error" } }); return; }
 
-    // Extract auth
     const authHeader = req.headers["authorization"] || "";
     const authToken = req.headers["x-auth-token"] || (authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "") || process.env.NOAH_AUTH_TOKEN || "";
-
-    if (!authToken) {
-      sendJson(res, 401, { error: { message: "Missing auth token. Use Authorization: Bearer <NOAH_AI_AUTH_TOKEN>", type: "authentication_error" } });
-      return;
-    }
+    if (!authToken) { sendJson(res, 401, { error: { message: "Missing auth token", type: "authentication_error" } }); return; }
 
     const extraCookies = req.headers["x-extra-cookies"] || params.extra_cookies || process.env.NOAH_EXTRA_COOKIES || "";
 
-    try {
-      await handleCompletions(params, authToken, extraCookies, res);
-    } catch (err) {
+    if (!pool.initialized) { sendJson(res, 503, { error: { message: "Session pool not ready", type: "server_error" } }); return; }
+
+    try { await handleCompletions(params, authToken, extraCookies, res); }
+    catch (err) {
       if (!res.headersSent) sendJson(res, 500, { error: { message: err.message, type: "server_error" } });
-      else if (!res.writableEnded) { res.write(`data: ${JSON.stringify({ error: { message: err.message } })}\n\n`); res.end(); }
     }
 
   } else if (url === "/v1/models" && req.method === "GET") {
@@ -475,23 +486,45 @@ const server = http.createServer(async (req, res) => {
       ],
     });
 
-  } else if (url === "/health") {
-    sendJson(res, 200, { status: "ok", version: "2.0.0", upstream: NOAH_BASE });
+  } else if (url === "/health" || url === "/pool") {
+    sendJson(res, 200, { status: "ok", version: "2.1.0", upstream: NOAH_BASE, pool: pool.stats() });
 
   } else {
     sendJson(res, 404, { error: { message: "Not found", type: "invalid_request_error" } });
   }
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(`noah-ai-proxy v2.0 — OpenAI-compatible bridge`);
-  console.log(`Listening: http://${HOST}:${PORT}`);
-  console.log(`Upstream:  ${NOAH_BASE}`);
-  console.log(`\nEndpoints:`);
-  console.log(`  POST /v1/chat/completions  — Chat (stream + non-stream + tool calling)`);
-  console.log(`  GET  /v1/models            — Model list`);
-  console.log(`  GET  /health               — Health check`);
-});
+// ─── Startup ────────────────────────────────────────────────────────────────
+
+async function main() {
+  const authToken = process.env.NOAH_AUTH_TOKEN;
+  const extraCookies = process.env.NOAH_EXTRA_COOKIES || "";
+
+  if (!authToken) {
+    console.error("[Fatal] NOAH_AUTH_TOKEN environment variable is required");
+    process.exit(1);
+  }
+
+  try {
+    await pool.init(authToken, extraCookies, DEFAULT_GPTS_ID);
+  } catch (err) {
+    console.error(`[Fatal] Pool init failed: ${err.message}`);
+    process.exit(1);
+  }
+
+  server.listen(PORT, HOST, () => {
+    console.log(`\nnoah-ai-proxy v2.1 — Session Pool Mode`);
+    console.log(`Listening: http://${HOST}:${PORT}`);
+    console.log(`Upstream:  ${NOAH_BASE}`);
+    console.log(`Pool:      ${pool.sessions.length} sessions ready`);
+    console.log(`\nEndpoints:`);
+    console.log(`  POST /v1/chat/completions`);
+    console.log(`  GET  /v1/models`);
+    console.log(`  GET  /health (includes pool stats)`);
+  });
+}
+
+main();
 
 process.on("SIGTERM", () => { server.close(); process.exit(0); });
 process.on("SIGINT", () => { server.close(); process.exit(0); });
