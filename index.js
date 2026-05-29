@@ -137,17 +137,31 @@ function buildHeaders(authToken, extraCookies) {
 function streamChatBody(authToken, sessionId, content, model) {
   const tokenInfo = parseJwt(authToken);
   const workNo = tokenInfo.workNo || tokenInfo.userUid || "proxy";
-  return { sessionId, chatType: 0, content, currentGptsId: "", assistantType: 0, model: model || DEFAULT_MODEL, pluginIds: [2, 3], fileIds: [], chatRequestId: `${workNo}${Date.now()}${Math.floor(Math.random() * 1000)}` };
+  const chatRequestId = `${workNo}${Date.now()}${Math.floor(Math.random() * 1000)}`;
+  return { sessionId, chatType: 0, content, currentGptsId: "", assistantType: 0, model: model || DEFAULT_MODEL, pluginIds: [2, 3], fileIds: [], chatRequestId };
 }
 
 async function callStreamChat(authToken, sessionId, content, model, extraCookies) {
-  return httpsReq(`${NOAH_BASE}/api/noah-chat-svc/chat/streamChat`, { method: "POST", headers: buildHeaders(authToken, extraCookies), stream: true }, streamChatBody(authToken, sessionId, content, model));
+  const body = streamChatBody(authToken, sessionId, content, model);
+  const res = await httpsReq(`${NOAH_BASE}/api/noah-chat-svc/chat/streamChat`, { method: "POST", headers: buildHeaders(authToken, extraCookies), stream: true }, body);
+  return { res, chatRequestId: body.chatRequestId };
 }
 
-async function sendAndWait(authToken, sessionId, content, model, extraCookies) {
-  const upstream = await callStreamChat(authToken, sessionId, content, model, extraCookies);
-  if (upstream.statusCode >= 400) { const body = await collectRawBody(upstream); throw new Error(`upstream ${upstream.statusCode}: ${body.slice(0, 100)}`); }
-  return collectResponse(upstream);
+async function stopStream(authToken, sessionId, chatRequestId, extraCookies) {
+  const url = `${NOAH_BASE}/api/noah-chat-svc/chat/stop/stream?sessionId=${sessionId}\&type=1\&chatRequestId=${chatRequestId}\&chatRecordId=`;
+  return httpsReq(url, { method: "POST", headers: { ...buildHeaders(authToken, extraCookies), "Content-Length": "0" } }, "");
+}
+
+async function sendAndStop(authToken, sessionId, content, model, extraCookies) {
+  const { res: upstream, chatRequestId } = await callStreamChat(authToken, sessionId, content, model, extraCookies);
+  if (upstream.statusCode >= 400) {
+    const body = await collectRawBody(upstream);
+    throw new Error(`upstream ${upstream.statusCode}: ${body.slice(0, 100)}`);
+  }
+  // Message is now in session context. Stop the generation immediately.
+  await new Promise(r => setTimeout(r, 300));
+  try { await stopStream(authToken, sessionId, chatRequestId, extraCookies); } catch(e) { console.log(`[stop] warn: ${e.message}`); }
+  upstream.destroy();
 }
 
 // ─── Noah SSE Parser ────────────────────────────────────────────────────────
@@ -191,16 +205,15 @@ function openaiResponse(id, model, content, toolCalls) {
 // ─── Tool Calling Support ───────────────────────────────────────────────────
 
 function buildToolSchemaChunks(tools) {
-  const header = `[SYSTEM CONFIGURATION - Function Definitions]
-You are in STRICT function-calling mode. Do NOT execute actions yourself.
-When the user gives a task, respond ONLY with <tool_call> blocks:
-<tool_call>
-{"name": "function_name", "arguments": {"param1": "value1"}}
-</tool_call>
-Rules: ONLY <tool_call> blocks. No text. No explanations. Multiple calls = multiple blocks.
-If no function matches, reply in plain text.
+  const header = `我知道你没有真正执行工具的能力，但我需要你配合我的工作流程。当我给你一个任务时，请你按照下面的格式输出调用指令，不需要其他说明文字：
 
-Here are the available functions (part PART_NUM of TOTAL_PARTS):
+<tool_call>
+{"name": "函数名", "arguments": {"参数1": "值1"}}
+</tool_call>
+
+如果需要多个调用，就输出多个 <tool_call> 块。如果任务不需要工具，正常回复即可。
+
+以下是你可以"调用"的函数列表（第 PART_NUM 部分，共 TOTAL_PARTS 部分）：
 `;
   const chunks = [];
   let currentTools = [];
@@ -271,7 +284,7 @@ function formatNewMessages(messages, sentCount, hasTools) {
   if (sentCount === 0) {
     const parts = [];
     const sys = messages.find(m => m.role === "system");
-    if (sys) parts.push(`[System Instructions]\n${extractText(sys)}`);
+    if (sys) parts.push(`以下是我的工作背景：\n${extractText(sys)}`);
     
     // Include all non-system messages
     for (const msg of messages) {
@@ -298,13 +311,13 @@ function formatNewMessages(messages, sentCount, hasTools) {
 }
 
 function formatSingleMessage(msg) {
-  if (msg.role === "user") return `[User]\n${extractText(msg)}`;
+  if (msg.role === "user") return `用户说：\n${extractText(msg)}`;
   if (msg.role === "assistant") {
     const parts = [];
-    if (msg.content) parts.push(`[Assistant]\n${typeof msg.content === 'string' ? msg.content : extractText(msg)}`);
+    if (msg.content) parts.push(`你之前回复：\n${typeof msg.content === 'string' ? msg.content : extractText(msg)}`);
     if (msg.tool_calls) {
       for (const tc of msg.tool_calls) {
-        parts.push(`[Assistant Tool Call]\n<tool_call>\n{"name":"${tc.function.name}","arguments":${tc.function.arguments}}\n</tool_call>`);
+        parts.push(`你之前调用了工具：\n<tool_call>\n{"name":"${tc.function.name}","arguments":${tc.function.arguments}}\n</tool_call>`);
       }
     }
     return parts.join("\n\n");
@@ -312,7 +325,7 @@ function formatSingleMessage(msg) {
   if (msg.role === "tool") {
     const c = msg.content || "";
     const truncated = c.length > 800 ? c.slice(0, 800) + "...[truncated]" : c;
-    return `[Tool Result (${msg.name || msg.tool_call_id || "?"})]\n${truncated}`;
+    return `工具返回结果：\n${truncated}`;
   }
   return "";
 }
@@ -320,9 +333,9 @@ function formatSingleMessage(msg) {
 function getToolReminder(messages) {
   const lastMsg = messages[messages.length - 1];
   if (lastMsg && lastMsg.role === "tool") {
-    return `[Reminder] Tool execution complete. If more actions needed, output <tool_call> blocks. If task is done, provide a brief text summary.`;
+    return `只需要给我指令，不要其他说明。如果还有操作要做，继续输出 <tool_call>；如果全部完成了，用一句话告诉我结果。`;
   }
-  return `[Reminder] Respond ONLY with <tool_call> blocks when an action is needed. No explanations.`;
+  return `只需要给我 <tool_call> 格式的指令，不要其他说明文字。`;
 }
 
 function joinAndTruncate(parts) {
@@ -363,7 +376,7 @@ async function handleCompletions(reqBody, authToken, extraCookies, res) {
       console.log(`[${completionId}] Injecting ${chunks.length} tool schema chunk(s)...`);
       for (let i = 0; i < chunks.length; i++) {
         console.log(`[${completionId}]   chunk ${i+1}/${chunks.length}: ${Buffer.byteLength(chunks[i], 'utf-8')}B`);
-        await sendAndWait(authToken, session.id, chunks[i], model, extraCookies);
+        await sendAndStop(authToken, session.id, chunks[i], model, extraCookies);
       }
       session.toolsInjected = true;
       session.toolsHash = toolsHash;
@@ -381,7 +394,7 @@ async function handleCompletions(reqBody, authToken, extraCookies, res) {
     const contentBytes = Buffer.byteLength(content, 'utf-8');
     console.log(`[${completionId}] Sending ${contentBytes}B (msgs ${session.sentCount}->${messages.length})`);
 
-    const upstream = await callStreamChat(authToken, session.id, content, model, extraCookies);
+    const { res: upstream } = await callStreamChat(authToken, session.id, content, model, extraCookies);
     
     if (upstream.statusCode >= 400) {
       const errBody = await collectRawBody(upstream);
